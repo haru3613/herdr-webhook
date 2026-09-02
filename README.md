@@ -2,7 +2,7 @@
 
 Herdr already knows when a pane is done or blocked. This plugin POSTs that change as JSON to a URL you own.
 
-POSTs only when agent_status changes into a notify status, done or blocked by default. A pane that is already settled does not fire again. First sighting of a pane is stored in last-status.json in the plugin config directory and skipped. If that file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet.
+POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen` and `posted` per pane. working does not clear `posted`, so done then working then done is one POST. idle or unknown clears `posted`, so a later done can fire. First sighting of a pane is stored and skipped. If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated.
 
 Requires Herdr 0.7.5 or newer and `python3` on linux or macOS.
 
@@ -24,10 +24,17 @@ Put secrets in the plugin config directory. GitHub installs replace the checkout
 
 ```sh
 CONFIG_DIR="$(herdr plugin config-dir jefflau.herdr-webhook)"
-cp .env.example "$CONFIG_DIR/.env"
+cat > "$CONFIG_DIR/.env" <<'EOF'
+WEBHOOK_URL=
+WEBHOOK_KEY=
+WEBHOOK_KEY_HEADER=
+NOTIFY_STATUSES=done,blocked
+SKIP_PANES=
+WEBHOOK_DRY_RUN=0
+EOF
 ```
 
-Edit `$CONFIG_DIR/.env`.
+That writes the file even if your shell is not in the plugin checkout. If you cloned the repo, `cp .env.example "$CONFIG_DIR/.env"` works from the clone. Then edit `$CONFIG_DIR/.env`.
 
 **WEBHOOK_URL.** The POST target.
 

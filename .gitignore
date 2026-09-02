@@ -2,6 +2,7 @@
 *.env
 !.env.example
 last-status.json
+last-status.json.lock
 __pycache__/
 *.pyc
 .DS_Store

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import ipaddress
 import json
 import os
@@ -20,6 +22,7 @@ EVENT_NAME = "pane.agent_status_changed"
 # JSON envelope uses snake_case EventKind; the env var uses the dotted name.
 EVENT_JSON_NAMES = frozenset({EVENT_NAME, "pane_agent_status_changed"})
 KNOWN_STATUSES = frozenset({"idle", "working", "blocked", "done", "unknown"})
+CLEAR_POSTED_STATUSES = frozenset({"idle", "unknown"})
 DEFAULT_STATUSES = ("done", "blocked")
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
 STATUS_FILENAME = "last-status.json"
@@ -115,15 +118,49 @@ def _agent_get(pane_id: str) -> dict:
     return {}
 
 
-def _normalize_status_map(raw) -> dict[str, str]:
+def _as_status(value) -> str:
+    status = _text(value).casefold()
+    return status if status in KNOWN_STATUSES else ""
+
+
+def _pane_state(seen: str, posted: str | None) -> dict[str, str | None]:
+    return {"seen": seen, "posted": posted}
+
+
+def _posted_for_seen(status: str, notify: set[str]) -> str | None:
+    if status in CLEAR_POSTED_STATUSES:
+        return None
+    if status in notify:
+        return status
+    return None
+
+
+def _coerce_pane_state(value, notify: set[str]) -> dict[str, str | None] | None:
+    if isinstance(value, str):
+        status = _as_status(value)
+        if not status:
+            return None
+        return _pane_state(status, _posted_for_seen(status, notify))
+    if not isinstance(value, dict):
+        return None
+    seen = _as_status(value.get("seen"))
+    if not seen:
+        return None
+    posted = _as_status(value.get("posted")) or None
+    return _pane_state(seen, posted)
+
+
+def _normalize_status_store(raw, notify: set[str]) -> dict[str, dict[str, str | None]]:
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, str | None]] = {}
     for key, value in raw.items():
         pane_id = _text(key)
-        status = _text(value).casefold()
-        if pane_id and status in KNOWN_STATUSES:
-            out[pane_id] = status
+        if not pane_id:
+            continue
+        state = _coerce_pane_state(value, notify)
+        if state is not None:
+            out[pane_id] = state
     return out
 
 
@@ -172,7 +209,7 @@ def _agent_list_statuses() -> dict[str, str]:
     return out
 
 
-def _atomic_write_json(path: str, data: dict[str, str]) -> None:
+def _atomic_write_json(path: str, data: dict) -> None:
     directory = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(prefix=".last-status.", suffix=".tmp", dir=directory)
     try:
@@ -190,7 +227,28 @@ def _atomic_write_json(path: str, data: dict[str, str]) -> None:
         raise
 
 
-def _load_or_seed_statuses(path: str) -> dict[str, str]:
+@contextlib.contextmanager
+def _status_lock(path: str):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    lock_path = path + ".lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _persist_store(path: str, store: dict) -> None:
+    try:
+        _atomic_write_json(path, store)
+    except OSError:
+        pass
+
+
+def _load_or_seed_statuses(path: str, notify: set[str]) -> dict[str, dict[str, str | None]]:
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as fh:
@@ -199,13 +257,62 @@ def _load_or_seed_statuses(path: str) -> dict[str, str]:
             raw = None
         else:
             if isinstance(raw, dict):
-                return _normalize_status_map(raw)
-    seeded = _agent_list_statuses()
-    try:
-        _atomic_write_json(path, seeded)
-    except OSError:
-        pass
+                return _normalize_status_store(raw, notify)
+    seeded: dict[str, dict[str, str | None]] = {}
+    for pane_id, status in _agent_list_statuses().items():
+        seeded[pane_id] = _pane_state(status, _posted_for_seen(status, notify))
+    _persist_store(path, seeded)
     return dict(seeded)
+
+
+def _should_post(
+    record: dict[str, str | None] | None,
+    status: str,
+    notify: set[str],
+) -> bool:
+    if record is None:
+        return False
+    return status in notify and record.get("seen") != status and record.get("posted") != status
+
+
+def _next_pane_state(
+    record: dict[str, str | None] | None,
+    status: str,
+    notify: set[str],
+    *,
+    posted_now: bool,
+) -> dict[str, str | None]:
+    posted = record.get("posted") if record else None
+    if status in CLEAR_POSTED_STATUSES:
+        new_posted = None
+    elif posted_now:
+        new_posted = status
+    elif record is None:
+        new_posted = _posted_for_seen(status, notify)
+    else:
+        new_posted = posted
+    return _pane_state(status, new_posted)
+
+
+def _record_status(
+    path: str,
+    pane_id: str,
+    status: str,
+    notify: set[str],
+    *,
+    expected_seen: str | None,
+) -> None:
+    with _status_lock(path):
+        store = _load_or_seed_statuses(path, notify)
+        current = store.get(pane_id)
+        current_seen = _as_status(current.get("seen")) if current else ""
+        if current_seen in CLEAR_POSTED_STATUSES and current_seen != _as_status(expected_seen):
+            return
+        if current_seen and current_seen != _as_status(expected_seen) and current_seen != status:
+            store[pane_id] = _pane_state(current_seen, status)
+        else:
+            store[pane_id] = _next_pane_state(current, status, notify, posted_now=True)
+        _persist_store(path, store)
 
 
 def _context() -> dict:
@@ -264,7 +371,7 @@ def _check_url(url: str) -> str:
 
 def _post(url: str, body: bytes, headers: dict[str, str]) -> int:
     request = urllib.request.Request(url, data=body, method="POST", headers=headers)
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
         with opener.open(request, timeout=8) as resp:
             resp.read()
@@ -317,17 +424,16 @@ def main() -> int:
         return 0
 
     status_path = os.path.join(config_dir, STATUS_FILENAME)
-    store = _load_or_seed_statuses(status_path)
-    previous = store.get(pane_id)
     notify = _notify_statuses(cfg.get("NOTIFY_STATUSES") or "")
-    should_post = status in notify and previous is not None and previous != status
-    store[pane_id] = status
-    try:
-        _atomic_write_json(status_path, store)
-    except OSError:
-        pass
-    if not should_post:
-        return 0
+    expected_seen: str | None = None
+    with _status_lock(status_path):
+        store = _load_or_seed_statuses(status_path, notify)
+        record = store.get(pane_id)
+        expected_seen = _as_status(record.get("seen")) if record else ""
+        if not _should_post(record, status, notify):
+            store[pane_id] = _next_pane_state(record, status, notify, posted_now=False)
+            _persist_store(status_path, store)
+            return 0
 
     webhook_url = cfg.get("WEBHOOK_URL", "").strip()
     webhook_key = cfg.get("WEBHOOK_KEY", "").strip()
@@ -363,6 +469,9 @@ def main() -> int:
 
     pane_name = name or terminal_title_stripped or display_agent
     if _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or "")):
+        _record_status(
+            status_path, pane_id, status, notify, expected_seen=expected_seen
+        )
         return 0
 
     payload = {
@@ -380,6 +489,9 @@ def main() -> int:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     if dry_run:
         sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        _record_status(
+            status_path, pane_id, status, notify, expected_seen=expected_seen
+        )
         return 0
 
     url_error = _check_url(webhook_url)
@@ -397,7 +509,12 @@ def main() -> int:
         else:
             print("invalid WEBHOOK_KEY_HEADER", file=sys.stderr)
             return 1
-    return _post(webhook_url, body, headers)
+    result = _post(webhook_url, body, headers)
+    if result == 0:
+        _record_status(
+            status_path, pane_id, status, notify, expected_seen=expected_seen
+        )
+    return result
 
 
 if __name__ == "__main__":

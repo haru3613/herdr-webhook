@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "hook.py"
 FAKE_KEY = "test-key-not-real"
 EVENT_NAME = "pane.agent_status_changed"
+API = {"name": "api", "cwd": "/tmp/src/api", "agent": "claude"}
 
 
 class _Recorder(HTTPServer):
@@ -41,6 +42,17 @@ def _handler():
             if self.path == "/fail":
                 self.send_response(500)
                 self.end_headers()
+                return
+            if self.path == "/idle-during-post":
+                status_path = getattr(self.server, "status_path", "")
+                if status_path:
+                    Path(status_path).write_text(
+                        json.dumps({"w1:p1": {"seen": "idle", "posted": None}}) + "\n",
+                        encoding="utf-8",
+                    )
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
                 return
             if self.path == "/redirect":
                 host, port = self.server.server_address
@@ -83,7 +95,7 @@ class HookTests(unittest.TestCase):
             f"Path({str(self.stub_log)!r}).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
             "if len(sys.argv) >= 2 and sys.argv[1:3] == ['agent', 'list']:\n"
             "    raw = os.environ.get('HERDR_STUB_LIST_JSON') or '[]'\n"
-            "    print(json.dumps({'result': {'agents': json.loads(raw)}}))\n"
+            "    print(json.dumps({'result': {'type': 'agent_list', 'agents': json.loads(raw)}}))\n"
             "    raise SystemExit(0)\n"
             "raw = os.environ.get('HERDR_STUB_AGENT_JSON') or '{}'\n"
             "if len(sys.argv) >= 3 and sys.argv[1:3] == ['agent', 'get']:\n"
@@ -98,6 +110,7 @@ class HookTests(unittest.TestCase):
         self.thread.start()
         self.host, self.port = self.server.server_address
         self.base = f"http://{self.host}:{self.port}"
+        self.server.status_path = str(self.config / "last-status.json")
 
     def tearDown(self):
         self.server.shutdown()
@@ -112,7 +125,7 @@ class HookTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _write_status(self, mapping: dict[str, str]) -> None:
+    def _write_status(self, mapping: dict) -> None:
         (self.config / "last-status.json").write_text(
             json.dumps(mapping) + "\n",
             encoding="utf-8",
@@ -124,6 +137,12 @@ class HookTests(unittest.TestCase):
             return {}
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _assert_pane(self, seen: str, posted: str | None, pane_id: str = "w1:p1") -> None:
+        self.assertEqual(
+            self._read_status().get(pane_id),
+            {"seen": seen, "posted": posted},
+        )
+
     def _run(
         self,
         event_json: str,
@@ -133,6 +152,17 @@ class HookTests(unittest.TestCase):
         herdr_bin: str | None = None,
     ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
+        for key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            env.pop(key, None)
+        env["NO_PROXY"] = "*"
+        env["no_proxy"] = "*"
         env.update(
             {
                 "HERDR_PLUGIN_EVENT": EVENT_NAME,
@@ -203,6 +233,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(payload["agent"], "claude")
         self.assertIn("ts", payload)
         self.assertNotIn("pane name", payload)
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_h1_cwd_present_still_looks_up_name(self):
@@ -223,12 +254,13 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "idle"})
         proc = self._run(
             _event(),
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(len(self.server.requests), 1)
         self.assertEqual(self.server.requests[0]["path"], "/redirect")
         self.assertIn("POST failed: HTTP 302", proc.stderr)
+        self.assertEqual(self._read_status().get("w1:p1"), "idle")
         self._assert_no_secrets(proc)
 
     def test_posts_snake_case_payload_and_bearer(self):
@@ -253,6 +285,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(payload["pane_name"], "api")
         self.assertEqual(payload["pane_id"], "w1:p1")
         self.assertEqual(payload["workspace_label"], "api")
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_optional_key_header(self):
@@ -260,7 +293,7 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "idle"})
         proc = self._run(
             _event(),
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         headers = self.server.requests[0]["headers"]
@@ -289,7 +322,7 @@ class HookTests(unittest.TestCase):
         proc = self._run(_event(agent_status="idle"), agent={"name": "api"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
-        self.assertEqual(self._read_status().get("w1:p1"), "idle")
+        self._assert_pane("idle", None)
         self._assert_no_secrets(proc)
 
     def test_missing_env_exits_zero(self):
@@ -303,10 +336,11 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "idle"})
         proc = self._run(
             _event(),
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("POST failed: HTTP 500", proc.stderr)
+        self.assertEqual(self._read_status().get("w1:p1"), "idle")
         self._assert_no_secrets(proc)
 
     def test_wrong_event_env_is_ignored(self):
@@ -327,6 +361,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         self.assertIn("agent get failed for w1:p1", proc.stderr)
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_invalid_json_exits_zero(self):
@@ -354,7 +389,7 @@ class HookTests(unittest.TestCase):
         )
         proc = self._run(
             envelope,
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
@@ -373,12 +408,13 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "idle"})
         proc = self._run(
             _event(),
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("POST failed: invalid URL", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertEqual(self.server.requests, [])
+        self.assertEqual(self._read_status().get("w1:p1"), "idle")
         self._assert_no_secrets(proc)
 
     def test_first_seen_done_does_not_post(self):
@@ -386,7 +422,7 @@ class HookTests(unittest.TestCase):
         proc = self._run(_event(), agent={"name": "api"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
-        self.assertEqual(self._read_status().get("w1:p1"), "done")
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_seed_list_already_done_event_done_does_not_post(self):
@@ -402,7 +438,7 @@ class HookTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
-        self.assertEqual(self._read_status().get("w1:p1"), "done")
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_idle_then_done_posts(self):
@@ -410,13 +446,13 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "idle"})
         proc = self._run(
             _event(),
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         payload = json.loads(self.server.requests[0]["body"])
         self.assertEqual(payload["status"], "done")
-        self.assertEqual(self._read_status().get("w1:p1"), "done")
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_done_then_done_does_not_post(self):
@@ -425,7 +461,107 @@ class HookTests(unittest.TestCase):
         proc = self._run(_event(), agent={"name": "api"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
-        self.assertEqual(self._read_status().get("w1:p1"), "done")
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_seed_list_working_then_done_posts(self):
+        self._write_env()
+        proc = self._run(
+            _event(),
+            extra_env={
+                "HERDR_STUB_LIST_JSON": json.dumps(
+                    [
+                        {
+                            "pane_id": "w1:p1",
+                            "agent_status": "working",
+                            "name": "api",
+                        }
+                    ]
+                )
+            },
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        payload = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(payload["status"], "done")
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_proxy_env_does_not_divert_localhost(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(
+            _event(),
+            extra_env={
+                "HTTP_PROXY": "http://127.0.0.1:1",
+                "HTTPS_PROXY": "http://127.0.0.1:1",
+                "http_proxy": "http://127.0.0.1:1",
+                "https_proxy": "http://127.0.0.1:1",
+                "NO_PROXY": "",
+                "no_proxy": "",
+            },
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_no_secrets(proc)
+
+    def test_idle_then_done_then_working_then_done_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("working", "done")
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_done_then_done_one_post_total(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_done_working_done_one_post_total(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("working", "done")
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_done_idle_done_posts_twice(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self._run(_event(agent_status="idle"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_pane("idle", None)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        payload = json.loads(self.server.requests[1]["body"])
+        self.assertEqual(payload["status"], "done")
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_done_then_blocked_posts(self):
@@ -433,13 +569,48 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "done"})
         proc = self._run(
             _event(agent_status="blocked"),
-            agent={"name": "api", "cwd": "/tmp/src/api", "agent": "claude"},
+            agent=API,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         payload = json.loads(self.server.requests[0]["body"])
         self.assertEqual(payload["status"], "blocked")
-        self.assertEqual(self._read_status().get("w1:p1"), "blocked")
+        self._assert_pane("blocked", "blocked")
+        self._assert_no_secrets(proc)
+
+    def test_old_flat_done_event_done_does_not_post(self):
+        self._write_env()
+        self._write_status({"w1:p1": "done"})
+        proc = self._run(_event(), agent={"name": "api"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_idle_during_in_flight_post_does_not_rewind(self):
+        self._write_env(path="/idle-during-post")
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("idle", None)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_unknown_clears_posted(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(_event(agent_status="unknown"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("unknown", None)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
 
