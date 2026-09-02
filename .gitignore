@@ -1,6 +1,7 @@
 .env
 *.env
 !.env.example
+last-status.json
 __pycache__/
 *.pyc
 .DS_Store

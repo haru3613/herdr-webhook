@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -16,9 +17,12 @@ from fnmatch import fnmatchcase
 from urllib.parse import urlparse
 
 EVENT_NAME = "pane.agent_status_changed"
+# JSON envelope uses snake_case EventKind; the env var uses the dotted name.
+EVENT_JSON_NAMES = frozenset({EVENT_NAME, "pane_agent_status_changed"})
 KNOWN_STATUSES = frozenset({"idle", "working", "blocked", "done", "unknown"})
 DEFAULT_STATUSES = ("done", "blocked")
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
+STATUS_FILENAME = "last-status.json"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -111,6 +115,99 @@ def _agent_get(pane_id: str) -> dict:
     return {}
 
 
+def _normalize_status_map(raw) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        pane_id = _text(key)
+        status = _text(value).casefold()
+        if pane_id and status in KNOWN_STATUSES:
+            out[pane_id] = status
+    return out
+
+
+def _agent_list_statuses() -> dict[str, str]:
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    try:
+        proc = subprocess.run(
+            [herdr, "agent", "list"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    try:
+        body = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    agents = None
+    result = body.get("result")
+    if isinstance(result, dict):
+        maybe = result.get("agents")
+        if isinstance(maybe, list):
+            agents = maybe
+    elif isinstance(result, list):
+        agents = result
+    if agents is None:
+        maybe = body.get("agents")
+        if isinstance(maybe, list):
+            agents = maybe
+    if not isinstance(agents, list):
+        return {}
+    out: dict[str, str] = {}
+    for item in agents:
+        if not isinstance(item, dict):
+            continue
+        pane_id = _text(item.get("pane_id"))
+        status = _text(item.get("agent_status")).casefold()
+        if pane_id and status in KNOWN_STATUSES:
+            out[pane_id] = status
+    return out
+
+
+def _atomic_write_json(path: str, data: dict[str, str]) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".last-status.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _load_or_seed_statuses(path: str) -> dict[str, str]:
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            raw = None
+        else:
+            if isinstance(raw, dict):
+                return _normalize_status_map(raw)
+    seeded = _agent_list_statuses()
+    try:
+        _atomic_write_json(path, seeded)
+    except OSError:
+        pass
+    return dict(seeded)
+
+
 def _context() -> dict:
     raw = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or ""
     if not raw.strip():
@@ -151,10 +248,13 @@ def _is_loopback(host: str) -> bool:
 
 
 def _check_url(url: str) -> str:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except ValueError:
+        return "POST failed: invalid URL"
     if parsed.scheme not in {"http", "https"}:
         return "POST failed: URL must be http or https"
-    host = parsed.hostname or ""
     if not host:
         return "POST failed: invalid URL"
     if parsed.scheme == "http" and not _is_loopback(host):
@@ -193,19 +293,40 @@ def main() -> int:
     if not isinstance(raw, dict):
         return 0
     json_event = raw.get("event")
-    if isinstance(json_event, str) and json_event and json_event != EVENT_NAME:
+    if isinstance(json_event, str) and json_event and json_event not in EVENT_JSON_NAMES:
         return 0
 
     nested = raw.get("data")
     data = nested if isinstance(nested, dict) else {}
 
     config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or ""
-    env_path = os.path.join(config_dir, ".env") if config_dir else ""
-    if not env_path or not os.path.isfile(env_path):
+    if not config_dir:
         return 0
+
+    cfg: dict[str, str] = {}
+    env_path = os.path.join(config_dir, ".env")
+    if os.path.isfile(env_path):
+        try:
+            cfg = _load_env(env_path)
+        except OSError:
+            cfg = {}
+
+    status = _field(data, raw, "agent_status").casefold()
+    pane_id = _field(data, raw, "pane_id")
+    if not pane_id or status not in KNOWN_STATUSES:
+        return 0
+
+    status_path = os.path.join(config_dir, STATUS_FILENAME)
+    store = _load_or_seed_statuses(status_path)
+    previous = store.get(pane_id)
+    notify = _notify_statuses(cfg.get("NOTIFY_STATUSES") or "")
+    should_post = status in notify and previous is not None and previous != status
+    store[pane_id] = status
     try:
-        cfg = _load_env(env_path)
+        _atomic_write_json(status_path, store)
     except OSError:
+        pass
+    if not should_post:
         return 0
 
     webhook_url = cfg.get("WEBHOOK_URL", "").strip()
@@ -215,11 +336,6 @@ def main() -> int:
     if not dry_run and (not webhook_url or not webhook_key):
         return 0
 
-    status = _field(data, raw, "agent_status").casefold()
-    if status not in _notify_statuses(cfg.get("NOTIFY_STATUSES") or ""):
-        return 0
-
-    pane_id = _field(data, raw, "pane_id")
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
     name = _field(data, raw, "name")

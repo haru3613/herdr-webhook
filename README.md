@@ -2,6 +2,8 @@
 
 Herdr already knows when a pane is done or blocked. This plugin POSTs that change as JSON to a URL you own.
 
+POSTs only when agent_status changes into a notify status, done or blocked by default. A pane that is already settled does not fire again. First sighting of a pane is stored in last-status.json in the plugin config directory and skipped. If that file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet.
+
 Requires Herdr 0.7.5 or newer and `python3` on linux or macOS.
 
 ## Install
@@ -41,7 +43,7 @@ Edit `$CONFIG_DIR/.env`.
 
 A missing `.env`, an empty URL, or an empty key makes the hook exit 0. An installed plugin with no config stays quiet.
 
-Matching statuses always run `herdr agent get` for the pane name, even when the event already has a cwd. If the lookup fails, the hook still POSTs what it has and writes one line to stderr.
+A notify transition always runs `herdr agent get` for the pane name, even when the event already has a cwd. If the lookup fails, the hook still POSTs what it has and writes one line to stderr.
 
 Plain `http://` is refused unless the host is loopback. Redirects are not followed, so a 302 cannot carry the bearer token to another host.
 
@@ -72,7 +74,7 @@ Skip matching uses the resolved pane name. A pane Herdr cannot name still notifi
 
 ## Dry run
 
-Set `WEBHOOK_DRY_RUN=1` and trip a matching status. `herdr plugin log list` should show the JSON and no POST.
+Set `WEBHOOK_DRY_RUN=1` and trip a notify transition. `herdr plugin log list` should show the JSON and no POST.
 
 ## Grok Bot webhook routines
 
@@ -80,4 +82,4 @@ Create a webhook routine in Grok Bot. The URL and sender key live in that routin
 
 Put `WEBHOOK_URL` and `WEBHOOK_KEY` in the plugin `.env`. For Grok Bot also set `WEBHOOK_KEY_HEADER=X-Automation-Key`.
 
-When a pane hits done or blocked, Herdr POSTs the JSON. The Grok Bot lead receives the webhook and dumps the result to the user.
+When a pane transitions into done or blocked, Herdr POSTs the JSON. The Grok Bot lead receives the webhook and dumps the result to the user.
