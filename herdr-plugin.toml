@@ -1,0 +1,10 @@
+id = "jefflau.herdr-webhook"
+name = "Herdr Webhook"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "POST agent status changes to a webhook URL."
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "hook.py"]
