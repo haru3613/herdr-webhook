@@ -2,7 +2,7 @@
 
 Herdr already knows when a pane is done or blocked. This plugin POSTs that change as JSON to a URL you own.
 
-POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen` and `posted` per pane. working does not clear `posted`, so done then working then done is one POST. idle or unknown clears `posted`, so a later done can fire. First sighting of a pane is stored and skipped. If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated.
+POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen` and `posted` per pane. working does not clear `posted`, so done then working then done is one POST. idle or unknown clears `posted`, so a later done can fire. First sighting of a pane is stored and skipped. If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated. `posted` is claimed before the POST goes out, so overlapping hook runs for the same pane cannot both fire. If the POST fails, that run's claim is cleared and the next transition into that status retries. A newer overlapping claim is left alone.
 
 Requires Herdr 0.7.5 or newer and `python3` on linux or macOS.
 

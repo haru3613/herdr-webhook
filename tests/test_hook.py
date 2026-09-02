@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -54,6 +55,13 @@ def _handler():
                 self.end_headers()
                 self.wfile.write(b"ok")
                 return
+            if self.path == "/slow-fail":
+                time.sleep(2.0)
+                self.send_response(500)
+                self.end_headers()
+                return
+            if self.path == "/slow":
+                time.sleep(2.0)
             if self.path == "/redirect":
                 host, port = self.server.server_address
                 self.send_response(302)
@@ -138,10 +146,10 @@ class HookTests(unittest.TestCase):
         return json.loads(path.read_text(encoding="utf-8"))
 
     def _assert_pane(self, seen: str, posted: str | None, pane_id: str = "w1:p1") -> None:
-        self.assertEqual(
-            self._read_status().get(pane_id),
-            {"seen": seen, "posted": posted},
-        )
+        rec = self._read_status().get(pane_id)
+        self.assertIsInstance(rec, dict, rec)
+        self.assertEqual(rec.get("seen"), seen)
+        self.assertEqual(rec.get("posted"), posted)
 
     def _run(
         self,
@@ -151,6 +159,38 @@ class HookTests(unittest.TestCase):
         agent: dict | None = None,
         herdr_bin: str | None = None,
     ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(HOOK)],
+            capture_output=True,
+            text=True,
+            env=self._env(event_json, extra_env=extra_env, agent=agent, herdr_bin=herdr_bin),
+            timeout=15,
+            check=False,
+        )
+
+    def _start(
+        self,
+        event_json: str,
+        *,
+        extra_env: dict[str, str] | None = None,
+        agent: dict | None = None,
+    ) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, str(HOOK)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._env(event_json, extra_env=extra_env, agent=agent, herdr_bin=None),
+        )
+
+    def _env(
+        self,
+        event_json: str,
+        *,
+        extra_env: dict[str, str] | None,
+        agent: dict | None,
+        herdr_bin: str | None,
+    ) -> dict[str, str]:
         env = os.environ.copy()
         for key in (
             "HTTP_PROXY",
@@ -174,14 +214,7 @@ class HookTests(unittest.TestCase):
         )
         if extra_env:
             env.update(extra_env)
-        return subprocess.run(
-            [sys.executable, str(HOOK)],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=15,
-            check=False,
-        )
+        return env
 
     def _assert_no_secrets(self, proc: subprocess.CompletedProcess) -> None:
         combined = f"{proc.stdout}\n{proc.stderr}"
@@ -260,7 +293,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 1)
         self.assertEqual(self.server.requests[0]["path"], "/redirect")
         self.assertIn("POST failed: HTTP 302", proc.stderr)
-        self.assertEqual(self._read_status().get("w1:p1"), "idle")
+        self._assert_pane("done", None)
         self._assert_no_secrets(proc)
 
     def test_posts_snake_case_payload_and_bearer(self):
@@ -340,7 +373,7 @@ class HookTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("POST failed: HTTP 500", proc.stderr)
-        self.assertEqual(self._read_status().get("w1:p1"), "idle")
+        self._assert_pane("done", None)
         self._assert_no_secrets(proc)
 
     def test_wrong_event_env_is_ignored(self):
@@ -414,7 +447,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("POST failed: invalid URL", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertEqual(self.server.requests, [])
-        self.assertEqual(self._read_status().get("w1:p1"), "idle")
+        self._assert_pane("done", None)
         self._assert_no_secrets(proc)
 
     def test_first_seen_done_does_not_post(self):
@@ -594,6 +627,100 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("idle", None)
+        self._write_env()
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_failed_post_releases_claim_so_next_done_retries(self):
+        self._write_env(path="/fail")
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 1)
+        self._assert_pane("done", None)
+        self._write_env()
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_pane("working", None)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([r["path"] for r in self.server.requests], ["/fail", "/hook"])
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_overlapping_done_working_done_posts_once(self):
+        self._write_env(path="/slow")
+        self._write_status({"w1:p1": "idle"})
+        first = self._start(_event(), agent=API)
+        time.sleep(0.7)
+        self._assert_pane("done", "done")
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_pane("working", "done")
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out, err = first.communicate(timeout=15)
+        self.assertEqual(first.returncode, 0, err)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertNotIn(FAKE_KEY, out + err)
+
+    def test_failed_post_does_not_release_a_newer_claim(self):
+        self._write_env(path="/slow-fail")
+        self._write_status({"w1:p1": "idle"})
+        first = self._start(_event(), agent=API)
+        second = None
+        try:
+            time.sleep(0.7)
+            self._assert_pane("done", "done")
+            proc = self._run(_event(agent_status="idle"), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self._assert_pane("idle", None)
+            self._write_env()
+            second = self._start(_event(), agent=API)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                rec = self._read_status().get("w1:p1") or {}
+                if rec.get("seen") == "done" and rec.get("posted") == "done":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("second run did not claim before the first POST finished")
+            out1, err1 = first.communicate(timeout=15)
+            self.assertEqual(first.returncode, 1, err1)
+            self.assertIn("POST failed: HTTP 500", err1)
+            self._assert_pane("done", "done")
+            out2, err2 = second.communicate(timeout=15)
+            self.assertEqual(second.returncode, 0, err2)
+            proc = self._run(_event(agent_status="working"), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            proc = self._run(_event(), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                [r["path"] for r in self.server.requests], ["/slow-fail", "/hook"]
+            )
+            self._assert_pane("done", "done")
+            self.assertNotIn(FAKE_KEY, out1 + err1 + out2 + err2)
+        finally:
+            for running in (first, second):
+                if running is not None and running.poll() is None:
+                    running.kill()
+                    running.communicate(timeout=5)
+
+    def test_idle_during_in_flight_post_from_idle_is_not_rewound(self):
+        self._write_env(path="/slow")
+        self._write_status({"w1:p1": "idle"})
+        first = self._start(_event(), agent=API)
+        time.sleep(0.7)
+        proc = self._run(_event(agent_status="idle"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out, err = first.communicate(timeout=15)
+        self.assertEqual(first.returncode, 0, err)
+        self._assert_pane("idle", None)
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 2)

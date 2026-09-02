@@ -123,8 +123,20 @@ def _as_status(value) -> str:
     return status if status in KNOWN_STATUSES else ""
 
 
-def _pane_state(seen: str, posted: str | None) -> dict[str, str | None]:
-    return {"seen": seen, "posted": posted}
+def _pane_state(
+    seen: str, posted: str | None, claim: int = 0
+) -> dict[str, str | int | None]:
+    state: dict[str, str | int | None] = {"seen": seen, "posted": posted}
+    if claim:
+        state["claim"] = claim
+    return state
+
+
+def _claim_n(record: dict | None) -> int:
+    if not record:
+        return 0
+    n = record.get("claim")
+    return n if type(n) is int and n > 0 else 0
 
 
 def _posted_for_seen(status: str, notify: set[str]) -> str | None:
@@ -135,7 +147,9 @@ def _posted_for_seen(status: str, notify: set[str]) -> str | None:
     return None
 
 
-def _coerce_pane_state(value, notify: set[str]) -> dict[str, str | None] | None:
+def _coerce_pane_state(
+    value, notify: set[str]
+) -> dict[str, str | int | None] | None:
     if isinstance(value, str):
         status = _as_status(value)
         if not status:
@@ -147,13 +161,15 @@ def _coerce_pane_state(value, notify: set[str]) -> dict[str, str | None] | None:
     if not seen:
         return None
     posted = _as_status(value.get("posted")) or None
-    return _pane_state(seen, posted)
+    return _pane_state(seen, posted, _claim_n(value))
 
 
-def _normalize_status_store(raw, notify: set[str]) -> dict[str, dict[str, str | None]]:
+def _normalize_status_store(
+    raw, notify: set[str]
+) -> dict[str, dict[str, str | int | None]]:
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, dict[str, str | None]] = {}
+    out: dict[str, dict[str, str | int | None]] = {}
     for key, value in raw.items():
         pane_id = _text(key)
         if not pane_id:
@@ -248,7 +264,9 @@ def _persist_store(path: str, store: dict) -> None:
         pass
 
 
-def _load_or_seed_statuses(path: str, notify: set[str]) -> dict[str, dict[str, str | None]]:
+def _load_or_seed_statuses(
+    path: str, notify: set[str]
+) -> dict[str, dict[str, str | int | None]]:
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as fh:
@@ -258,7 +276,7 @@ def _load_or_seed_statuses(path: str, notify: set[str]) -> dict[str, dict[str, s
         else:
             if isinstance(raw, dict):
                 return _normalize_status_store(raw, notify)
-    seeded: dict[str, dict[str, str | None]] = {}
+    seeded: dict[str, dict[str, str | int | None]] = {}
     for pane_id, status in _agent_list_statuses().items():
         seeded[pane_id] = _pane_state(status, _posted_for_seen(status, notify))
     _persist_store(path, seeded)
@@ -266,7 +284,7 @@ def _load_or_seed_statuses(path: str, notify: set[str]) -> dict[str, dict[str, s
 
 
 def _should_post(
-    record: dict[str, str | None] | None,
+    record: dict[str, str | int | None] | None,
     status: str,
     notify: set[str],
 ) -> bool:
@@ -276,42 +294,38 @@ def _should_post(
 
 
 def _next_pane_state(
-    record: dict[str, str | None] | None,
+    record: dict[str, str | int | None] | None,
     status: str,
     notify: set[str],
     *,
     posted_now: bool,
-) -> dict[str, str | None]:
+) -> dict[str, str | int | None]:
     posted = record.get("posted") if record else None
+    claim = _claim_n(record)
     if status in CLEAR_POSTED_STATUSES:
         new_posted = None
     elif posted_now:
         new_posted = status
+        claim += 1
     elif record is None:
         new_posted = _posted_for_seen(status, notify)
     else:
         new_posted = posted
-    return _pane_state(status, new_posted)
+    return _pane_state(status, new_posted, claim)
 
 
-def _record_status(
-    path: str,
-    pane_id: str,
-    status: str,
-    notify: set[str],
-    *,
-    expected_seen: str | None,
+def _release_claim(
+    path: str, pane_id: str, status: str, notify: set[str], claim: int
 ) -> None:
+    """Undo this run's posted claim after a failed POST so a later transition can retry."""
     with _status_lock(path):
         store = _load_or_seed_statuses(path, notify)
         current = store.get(pane_id)
-        current_seen = _as_status(current.get("seen")) if current else ""
-        if current_seen in CLEAR_POSTED_STATUSES and current_seen != _as_status(expected_seen):
+        if current is None or current.get("posted") != status:
             return
-        if current_seen and current_seen != _as_status(expected_seen) and current_seen != status:
-            store[pane_id] = _pane_state(current_seen, status)
-        else:
-            store[pane_id] = _next_pane_state(current, status, notify, posted_now=True)
+        if _claim_n(current) != claim:
+            return
+        store[pane_id] = _pane_state(current["seen"], None, claim)
         _persist_store(path, store)
 
 
@@ -425,22 +439,26 @@ def main() -> int:
 
     status_path = os.path.join(config_dir, STATUS_FILENAME)
     notify = _notify_statuses(cfg.get("NOTIFY_STATUSES") or "")
-    expected_seen: str | None = None
-    with _status_lock(status_path):
-        store = _load_or_seed_statuses(status_path, notify)
-        record = store.get(pane_id)
-        expected_seen = _as_status(record.get("seen")) if record else ""
-        if not _should_post(record, status, notify):
-            store[pane_id] = _next_pane_state(record, status, notify, posted_now=False)
-            _persist_store(status_path, store)
-            return 0
-
     webhook_url = cfg.get("WEBHOOK_URL", "").strip()
     webhook_key = cfg.get("WEBHOOK_KEY", "").strip()
     extra_header = cfg.get("WEBHOOK_KEY_HEADER", "").strip()
     dry_run = _truthy(os.environ.get("WEBHOOK_DRY_RUN") or cfg.get("WEBHOOK_DRY_RUN") or "")
-    if not dry_run and (not webhook_url or not webhook_key):
-        return 0
+    configured = dry_run or bool(webhook_url and webhook_key)
+
+    claimed = 0
+    with _status_lock(status_path):
+        store = _load_or_seed_statuses(status_path, notify)
+        record = store.get(pane_id)
+        if not configured or not _should_post(record, status, notify):
+            store[pane_id] = _next_pane_state(record, status, notify, posted_now=False)
+            _persist_store(status_path, store)
+            return 0
+        # Claim posted before HTTP so an overlapping run stays quiet. Success
+        # writes nothing; failure releases only this run's claim.
+        nxt = _next_pane_state(record, status, notify, posted_now=True)
+        store[pane_id] = nxt
+        _persist_store(status_path, store)
+        claimed = _claim_n(nxt)
 
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
@@ -469,9 +487,6 @@ def main() -> int:
 
     pane_name = name or terminal_title_stripped or display_agent
     if _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or "")):
-        _record_status(
-            status_path, pane_id, status, notify, expected_seen=expected_seen
-        )
         return 0
 
     payload = {
@@ -489,14 +504,12 @@ def main() -> int:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     if dry_run:
         sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
-        _record_status(
-            status_path, pane_id, status, notify, expected_seen=expected_seen
-        )
         return 0
 
     url_error = _check_url(webhook_url)
     if url_error:
         print(url_error, file=sys.stderr)
+        _release_claim(status_path, pane_id, status, notify, claimed)
         return 1
 
     headers = {
@@ -508,12 +521,11 @@ def main() -> int:
             headers[extra_header] = webhook_key
         else:
             print("invalid WEBHOOK_KEY_HEADER", file=sys.stderr)
+            _release_claim(status_path, pane_id, status, notify, claimed)
             return 1
     result = _post(webhook_url, body, headers)
-    if result == 0:
-        _record_status(
-            status_path, pane_id, status, notify, expected_seen=expected_seen
-        )
+    if result != 0:
+        _release_claim(status_path, pane_id, status, notify, claimed)
     return result
 
 
