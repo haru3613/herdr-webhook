@@ -77,6 +77,8 @@ Pane name is `name`, then `terminal_title_stripped`, then `display_agent`. Works
 
 Names you never want to notify go in `SKIP_PANES`. Globs work, so `logs-*` is one entry.
 
+A glob like `*-portrait` also hides job panes with that name, such as `tess-portrait`, so keep skip patterns narrower than your job names.
+
 Skip matching uses the resolved pane name. A pane Herdr cannot name still notifies, with a stderr line saying lookup failed.
 
 ## Dry run

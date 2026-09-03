@@ -240,6 +240,31 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.server.requests, [])
         self._assert_no_secrets(proc)
 
+    def test_skip_glob_portrait_pane_does_not_post_or_latch_posted(self):
+        self._write_env("SKIP_PANES=*-portrait\n")
+        self._write_status({"w1M:p1": "working"})
+        proc = self._run(
+            _event(pane_id="w1M:p1", workspace_id="w1M"),
+            agent={"name": "tess-portrait", "cwd": "/tmp/src/tess", "agent": "claude"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None, pane_id="w1M:p1")
+        self._assert_no_secrets(proc)
+
+    def test_skip_glob_portrait_leaves_other_panes_posting(self):
+        self._write_env("SKIP_PANES=*-portrait\n")
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            agent={"name": "tess", "cwd": "/tmp/src/tess", "agent": "claude"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["pane_name"], "tess")
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
     def test_dry_run_prints_payload_without_post(self):
         self._write_env("WEBHOOK_DRY_RUN=1\n")
         self._write_status({"w1:p1": "idle"})

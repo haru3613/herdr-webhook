@@ -445,21 +445,6 @@ def main() -> int:
     dry_run = _truthy(os.environ.get("WEBHOOK_DRY_RUN") or cfg.get("WEBHOOK_DRY_RUN") or "")
     configured = dry_run or bool(webhook_url and webhook_key)
 
-    claimed = 0
-    with _status_lock(status_path):
-        store = _load_or_seed_statuses(status_path, notify)
-        record = store.get(pane_id)
-        if not configured or not _should_post(record, status, notify):
-            store[pane_id] = _next_pane_state(record, status, notify, posted_now=False)
-            _persist_store(status_path, store)
-            return 0
-        # Claim posted before HTTP so an overlapping run stays quiet. Success
-        # writes nothing; failure releases only this run's claim.
-        nxt = _next_pane_state(record, status, notify, posted_now=True)
-        store[pane_id] = nxt
-        _persist_store(status_path, store)
-        claimed = _claim_n(nxt)
-
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
     name = _field(data, raw, "name")
@@ -472,7 +457,7 @@ def main() -> int:
         info = _agent_get(pane_id)
         if not info:
             print(
-                f"agent get failed for {pane_id}; sending partial payload",
+                f"agent get failed for {pane_id}; using event fields only",
                 file=sys.stderr,
             )
         else:
@@ -486,8 +471,27 @@ def main() -> int:
             workspace_id = workspace_id or _text(info.get("workspace_id"))
 
     pane_name = name or terminal_title_stripped or display_agent
-    if _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or "")):
-        return 0
+    skipped = _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or ""))
+
+    claimed = 0
+    with _status_lock(status_path):
+        store = _load_or_seed_statuses(status_path, notify)
+        record = store.get(pane_id)
+        if skipped:
+            # Skipped panes track seen only. Never claim posted for them.
+            store[pane_id] = _pane_state(status, None, _claim_n(record))
+            _persist_store(status_path, store)
+            return 0
+        if not configured or not _should_post(record, status, notify):
+            store[pane_id] = _next_pane_state(record, status, notify, posted_now=False)
+            _persist_store(status_path, store)
+            return 0
+        # Claim posted before HTTP so an overlapping run stays quiet. Success
+        # writes nothing; failure releases only this run's claim.
+        nxt = _next_pane_state(record, status, notify, posted_now=True)
+        store[pane_id] = nxt
+        _persist_store(status_path, store)
+        claimed = _claim_n(nxt)
 
     payload = {
         "event": EVENT_NAME,
