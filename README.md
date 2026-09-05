@@ -53,6 +53,8 @@ That writes the file even if your shell is not in the plugin checkout. If you cl
 
 **SETTLE_MS.** Milliseconds to wait and re-check live status before claiming a done or blocked POST, and before idle or unknown clears `posted`. Default 2500. `0` disables the wait. Set it in `.env` or the process environment.
 
+**NOTE.** SETTLE_MS re-check is a stopgap. Herdr 0.8.2 and preview plugins expose only `pane.agent_status_changed`. There is no job-level settle, session-end, or run-finished event. Screen-manifest agents, including Grok, emit turn-level done, so a turn gap looks like a finished job. Upgrade this when Herdr ships a cleaner job-level signal. Do not invent a sidecar EXIT file.
+
 A missing `.env`, an empty URL, or an empty key makes the hook exit 0. An installed plugin with no config stays quiet.
 
 A notify transition always runs `herdr agent get` for the pane name, even when the event already has a cwd. If the lookup fails, the hook still POSTs what it has and writes one line to stderr.

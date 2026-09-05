@@ -25,6 +25,9 @@ EVENT_JSON_NAMES = frozenset({EVENT_NAME, "pane_agent_status_changed"})
 KNOWN_STATUSES = frozenset({"idle", "working", "blocked", "done", "unknown"})
 CLEAR_POSTED_STATUSES = frozenset({"idle", "unknown"})
 DEFAULT_STATUSES = ("done", "blocked")
+# Stopgap until Herdr ships a job-level settle / session-end / run-finished
+# signal. Today only pane.agent_status_changed exists; screen-manifest agents
+# (incl Grok) emit turn-level done, so a turn gap looks like a finished job.
 DEFAULT_SETTLE_MS = 2500
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
 STATUS_FILENAME = "last-status.json"
@@ -74,6 +77,8 @@ def _live_agent_status(info: dict) -> str:
 
 
 def _status_settled(pane_id: str, status: str, settle_ms: int) -> bool:
+    # Confirm live herdr agent get still matches. Drop this wait when Herdr
+    # adds a real job-level settle; do not invent a sidecar EXIT protocol.
     if settle_ms <= 0:
         return True
     time.sleep(settle_ms / 1000.0)
