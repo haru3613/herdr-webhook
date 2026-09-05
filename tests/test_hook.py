@@ -199,6 +199,7 @@ class HookTests(unittest.TestCase):
             "http_proxy",
             "https_proxy",
             "all_proxy",
+            "SETTLE_MS",
         ):
             env.pop(key, None)
         env["NO_PROXY"] = "*"
@@ -214,6 +215,8 @@ class HookTests(unittest.TestCase):
         )
         if extra_env:
             env.update(extra_env)
+        if "SETTLE_MS" not in env:
+            env["SETTLE_MS"] = "0"
         return env
 
     def _assert_no_secrets(self, proc: subprocess.CompletedProcess) -> None:
@@ -763,6 +766,86 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_transient_done_does_not_post(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "80"},
+            agent={**API, "agent_status": "working"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self.assertIn("settle unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_stable_done_posts_after_settle(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "80"},
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        payload = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(payload["status"], "done")
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_transient_idle_keeps_posted(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(
+            _event(agent_status="idle"),
+            extra_env={"SETTLE_MS": "80"},
+            agent={**API, "agent_status": "working"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("idle", "done")
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_stable_idle_clears_posted(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(
+            _event(agent_status="idle"),
+            extra_env={"SETTLE_MS": "80"},
+            agent={**API, "agent_status": "idle"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("idle", None)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_settle_ms_zero_posts_without_live_confirm(self):
+        self._write_env()
+        self._write_status({"w1:p1": "idle"})
+        started = time.monotonic()
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "0"},
+            agent={**API, "agent_status": "working"},
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertLess(elapsed, 1.0)
+        self.assertNotIn("settle unconfirmed", proc.stderr)
         self._assert_no_secrets(proc)
 
 

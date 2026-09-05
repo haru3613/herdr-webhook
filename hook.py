@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ EVENT_JSON_NAMES = frozenset({EVENT_NAME, "pane_agent_status_changed"})
 KNOWN_STATUSES = frozenset({"idle", "working", "blocked", "done", "unknown"})
 CLEAR_POSTED_STATUSES = frozenset({"idle", "unknown"})
 DEFAULT_STATUSES = ("done", "blocked")
+DEFAULT_SETTLE_MS = 2500
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
 STATUS_FILENAME = "last-status.json"
 
@@ -52,6 +54,41 @@ def _field(data: dict, raw: dict, *keys: str) -> str:
 
 def _truthy(value: str) -> bool:
     return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _settle_ms(raw: str) -> int:
+    text = raw.strip()
+    if not text:
+        return DEFAULT_SETTLE_MS
+    try:
+        value = int(text)
+    except ValueError:
+        return DEFAULT_SETTLE_MS
+    if value < 0:
+        return DEFAULT_SETTLE_MS
+    return value
+
+
+def _live_agent_status(info: dict) -> str:
+    return _as_status(info.get("agent_status"))
+
+
+def _status_settled(pane_id: str, status: str, settle_ms: int) -> bool:
+    if settle_ms <= 0:
+        return True
+    time.sleep(settle_ms / 1000.0)
+    info = _agent_get(pane_id)
+    if not info:
+        return False
+    return _live_agent_status(info) == status
+
+
+def _should_clear_posted(
+    record: dict[str, str | int | None] | None, status: str
+) -> bool:
+    if status not in CLEAR_POSTED_STATUSES or record is None:
+        return False
+    return bool(record.get("posted"))
 
 
 def _load_env(path: str) -> dict[str, str]:
@@ -444,6 +481,7 @@ def main() -> int:
     extra_header = cfg.get("WEBHOOK_KEY_HEADER", "").strip()
     dry_run = _truthy(os.environ.get("WEBHOOK_DRY_RUN") or cfg.get("WEBHOOK_DRY_RUN") or "")
     configured = dry_run or bool(webhook_url and webhook_key)
+    settle_ms = _settle_ms(os.environ.get("SETTLE_MS") or cfg.get("SETTLE_MS") or "")
 
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
@@ -474,6 +512,8 @@ def main() -> int:
     skipped = _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or ""))
 
     claimed = 0
+    pending_http = False
+    needs_confirm = False
     with _status_lock(status_path):
         store = _load_or_seed_statuses(status_path, notify)
         record = store.get(pane_id)
@@ -482,16 +522,53 @@ def main() -> int:
             store[pane_id] = _pane_state(status, None, _claim_n(record))
             _persist_store(status_path, store)
             return 0
-        if not configured or not _should_post(record, status, notify):
-            store[pane_id] = _next_pane_state(record, status, notify, posted_now=False)
-            _persist_store(status_path, store)
+        should_post = configured and _should_post(record, status, notify)
+        should_clear = _should_clear_posted(record, status)
+        needs_confirm = settle_ms > 0 and (should_post or should_clear)
+        if not needs_confirm:
+            if should_post:
+                # Claim posted before HTTP so an overlapping run stays quiet.
+                # Success writes nothing; failure releases only this run's claim.
+                nxt = _next_pane_state(record, status, notify, posted_now=True)
+                store[pane_id] = nxt
+                _persist_store(status_path, store)
+                claimed = _claim_n(nxt)
+                pending_http = True
+            else:
+                store[pane_id] = _next_pane_state(
+                    record, status, notify, posted_now=False
+                )
+                _persist_store(status_path, store)
+                return 0
+
+    if needs_confirm:
+        if not _status_settled(pane_id, status, settle_ms):
+            print(f"settle unconfirmed for {pane_id}", file=sys.stderr)
+            with _status_lock(status_path):
+                store = _load_or_seed_statuses(status_path, notify)
+                record = store.get(pane_id)
+                posted = record.get("posted") if record else None
+                store[pane_id] = _pane_state(status, posted, _claim_n(record))
+                _persist_store(status_path, store)
             return 0
-        # Claim posted before HTTP so an overlapping run stays quiet. Success
-        # writes nothing; failure releases only this run's claim.
-        nxt = _next_pane_state(record, status, notify, posted_now=True)
-        store[pane_id] = nxt
-        _persist_store(status_path, store)
-        claimed = _claim_n(nxt)
+        with _status_lock(status_path):
+            store = _load_or_seed_statuses(status_path, notify)
+            record = store.get(pane_id)
+            if configured and _should_post(record, status, notify):
+                nxt = _next_pane_state(record, status, notify, posted_now=True)
+                store[pane_id] = nxt
+                _persist_store(status_path, store)
+                claimed = _claim_n(nxt)
+                pending_http = True
+            else:
+                store[pane_id] = _next_pane_state(
+                    record, status, notify, posted_now=False
+                )
+                _persist_store(status_path, store)
+                return 0
+
+    if not pending_http:
+        return 0
 
     payload = {
         "event": EVENT_NAME,

@@ -2,7 +2,7 @@
 
 Herdr already knows when a pane is done or blocked. This plugin POSTs that change as JSON to a URL you own.
 
-POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen` and `posted` per pane. working does not clear `posted`, so done then working then done is one POST. idle or unknown clears `posted`, so a later done can fire. First sighting of a pane is stored and skipped. If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated. `posted` is claimed before the POST goes out, so overlapping hook runs for the same pane cannot both fire. If the POST fails, that run's claim is cleared and the next transition into that status retries. A newer overlapping claim is left alone.
+POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen` and `posted` per pane. working does not clear `posted`, so done then working then done is one POST. Before a done or blocked POST, the hook waits SETTLE_MS (default 2500) and re-reads `herdr agent get`. If the live `agent_status` is no longer that event, or the get fails, it records `seen` and does not POST. idle or unknown clears `posted` only after the same confirm still reads idle or unknown, so a later done can fire. SETTLE_MS=0 skips the wait. First sighting of a pane is stored and skipped. If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated. `posted` is claimed before the POST goes out, so overlapping hook runs for the same pane cannot both fire. If the POST fails, that run's claim is cleared and the next transition into that status retries. A newer overlapping claim is left alone.
 
 Requires Herdr 0.7.5 or newer and `python3` on linux or macOS.
 
@@ -11,6 +11,8 @@ Requires Herdr 0.7.5 or newer and `python3` on linux or macOS.
 ```sh
 herdr plugin install jefflau/herdr-webhook
 ```
+
+GitHub installs replace the plugin checkout. The config directory `.env` stays in place, so reinstall does not wipe secrets.
 
 Or clone the repo and link it:
 
@@ -31,6 +33,7 @@ WEBHOOK_KEY_HEADER=
 NOTIFY_STATUSES=done,blocked
 SKIP_PANES=
 WEBHOOK_DRY_RUN=0
+SETTLE_MS=2500
 EOF
 ```
 
@@ -47,6 +50,8 @@ That writes the file even if your shell is not in the plugin checkout. If you cl
 **SKIP_PANES.** Comma-separated case-insensitive globs matched against the pane name. Empty means do not skip.
 
 **WEBHOOK_DRY_RUN.** `1` prints the JSON to stdout and skips the POST.
+
+**SETTLE_MS.** Milliseconds to wait and re-check live status before claiming a done or blocked POST, and before idle or unknown clears `posted`. Default 2500. `0` disables the wait. Set it in `.env` or the process environment.
 
 A missing `.env`, an empty URL, or an empty key makes the hook exit 0. An installed plugin with no config stays quiet.
 
