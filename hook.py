@@ -24,11 +24,21 @@ EVENT_NAME = "pane.agent_status_changed"
 EVENT_JSON_NAMES = frozenset({EVENT_NAME, "pane_agent_status_changed"})
 KNOWN_STATUSES = frozenset({"idle", "working", "blocked", "done", "unknown"})
 CLEAR_POSTED_STATUSES = frozenset({"idle", "unknown"})
+PRIOR_NOTIFY_SEEN = frozenset({"working", "blocked"})
 DEFAULT_STATUSES = ("done", "blocked")
 # Stopgap until Herdr ships a job-level settle / session-end / run-finished
 # signal. Today only pane.agent_status_changed exists; screen-manifest agents
 # (incl Grok) emit turn-level done, so a turn gap looks like a finished job.
-DEFAULT_SETTLE_MS = 2500
+# Do not invent a sidecar EXIT protocol.
+DEFAULT_SETTLE_MS = 10000
+SETTLE_SAMPLES = 3
+MID_RUN_TITLE_MARKERS = (
+    "thinking",
+    "responding",
+    "waiting for response",
+    "running",
+    "tool call",
+)
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
 STATUS_FILENAME = "last-status.json"
 
@@ -76,16 +86,45 @@ def _live_agent_status(info: dict) -> str:
     return _as_status(info.get("agent_status"))
 
 
-def _status_settled(pane_id: str, status: str, settle_ms: int) -> bool:
-    # Confirm live herdr agent get still matches. Drop this wait when Herdr
-    # adds a real job-level settle; do not invent a sidecar EXIT protocol.
-    if settle_ms <= 0:
-        return True
-    time.sleep(settle_ms / 1000.0)
-    info = _agent_get(pane_id)
+def _agent_title(info: dict) -> str:
+    return (
+        _text(info.get("terminal_title_stripped")) or _text(info.get("title"))
+    ).casefold()
+
+
+def _title_looks_mid_run(info: dict) -> bool:
+    title = _agent_title(info)
+    if not title:
+        return False
+    return any(marker in title for marker in MID_RUN_TITLE_MARKERS)
+
+
+def _sample_matches(info: dict, status: str, check_title: bool) -> bool:
     if not info:
         return False
-    return _live_agent_status(info) == status
+    if _live_agent_status(info) != status:
+        return False
+    if check_title and _title_looks_mid_run(info):
+        return False
+    return True
+
+
+def _status_settled(
+    pane_id: str, status: str, settle_ms: int, *, check_title: bool = False
+) -> bool:
+    # Confirm live herdr agent get still matches. Drop this wait when Herdr
+    # adds a real job-level settle; do not invent a sidecar EXIT protocol.
+    # SETTLE_MS=0: one immediate pass, no extra samples (fast tests).
+    if settle_ms <= 0:
+        return True
+    interval = (settle_ms / 1000.0) / (SETTLE_SAMPLES - 1)
+    for i in range(SETTLE_SAMPLES):
+        if i:
+            time.sleep(interval)
+        info = _agent_get(pane_id)
+        if not _sample_matches(info, status, check_title):
+            return False
+    return True
 
 
 def _should_clear_posted(
@@ -332,6 +371,10 @@ def _should_post(
 ) -> bool:
     if record is None:
         return False
+    # First-seed and unknown/idle → done must not fire. A notify POST
+    # needs a prior seen of working or blocked.
+    if record.get("seen") not in PRIOR_NOTIFY_SEEN:
+        return False
     return status in notify and record.get("seen") != status and record.get("posted") != status
 
 
@@ -529,6 +572,12 @@ def main() -> int:
             return 0
         should_post = configured and _should_post(record, status, notify)
         should_clear = _should_clear_posted(record, status)
+        if should_post and _title_looks_mid_run(info):
+            posted = record.get("posted") if record else None
+            store[pane_id] = _pane_state(status, posted, _claim_n(record))
+            _persist_store(status_path, store)
+            print(f"settle unconfirmed for {pane_id}", file=sys.stderr)
+            return 0
         needs_confirm = settle_ms > 0 and (should_post or should_clear)
         if not needs_confirm:
             if should_post:
@@ -547,7 +596,9 @@ def main() -> int:
                 return 0
 
     if needs_confirm:
-        if not _status_settled(pane_id, status, settle_ms):
+        if not _status_settled(
+            pane_id, status, settle_ms, check_title=should_post
+        ):
             print(f"settle unconfirmed for {pane_id}", file=sys.stderr)
             with _status_lock(status_path):
                 store = _load_or_seed_statuses(status_path, notify)

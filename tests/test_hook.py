@@ -107,7 +107,20 @@ class HookTests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "raw = os.environ.get('HERDR_STUB_AGENT_JSON') or '{}'\n"
             "if len(sys.argv) >= 3 and sys.argv[1:3] == ['agent', 'get']:\n"
-            "    print(json.dumps({'result': {'agent': json.loads(raw)}}))\n"
+            "    agent = json.loads(raw)\n"
+            "    seq_path = os.environ.get('HERDR_STUB_SEQ_PATH') or ''\n"
+            "    if seq_path:\n"
+            "        p = Path(seq_path)\n"
+            "        if p.is_file():\n"
+            "            seq = json.loads(p.read_text() or '[]')\n"
+            "            if seq:\n"
+            "                nxt = seq.pop(0)\n"
+            "                p.write_text(json.dumps(seq))\n"
+            "                if isinstance(nxt, str):\n"
+            "                    agent['agent_status'] = nxt\n"
+            "                elif isinstance(nxt, dict):\n"
+            "                    agent.update(nxt)\n"
+            "    print(json.dumps({'result': {'agent': agent}}))\n"
             "    raise SystemExit(0)\n"
             "raise SystemExit(1)\n",
             encoding="utf-8",
@@ -138,6 +151,11 @@ class HookTests(unittest.TestCase):
             json.dumps(mapping) + "\n",
             encoding="utf-8",
         )
+
+    def _seq_env(self, items: list) -> dict[str, str]:
+        path = self.dir / "agent-seq.json"
+        path.write_text(json.dumps(items), encoding="utf-8")
+        return {"HERDR_STUB_SEQ_PATH": str(path)}
 
     def _read_status(self) -> dict:
         path = self.config / "last-status.json"
@@ -234,7 +252,7 @@ class HookTests(unittest.TestCase):
 
     def test_skip_from_config(self):
         self._write_env("SKIP_PANES=noise-*,logs\n")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             agent={"name": "Noise-Worker", "cwd": "/tmp/src/api", "agent": "claude"},
@@ -270,7 +288,7 @@ class HookTests(unittest.TestCase):
 
     def test_dry_run_prints_payload_without_post(self):
         self._write_env("WEBHOOK_DRY_RUN=1\n")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             extra_env={"HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_label": "api"})},
@@ -299,7 +317,7 @@ class HookTests(unittest.TestCase):
 
     def test_h1_cwd_present_still_looks_up_name(self):
         self._write_env("SKIP_PANES=noise-pane\n")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(cwd="/tmp/src/api"),
             agent={"name": "noise-pane", "cwd": "/tmp/src/api", "agent": "claude"},
@@ -312,7 +330,7 @@ class HookTests(unittest.TestCase):
 
     def test_redirect_is_not_followed(self):
         self._write_env(path="/redirect")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             agent=API,
@@ -326,7 +344,7 @@ class HookTests(unittest.TestCase):
 
     def test_posts_snake_case_payload_and_bearer(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             extra_env={"HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_label": "api"})},
@@ -351,7 +369,7 @@ class HookTests(unittest.TestCase):
 
     def test_optional_key_header(self):
         self._write_env("WEBHOOK_KEY_HEADER=X-Automation-Key\n")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             agent=API,
@@ -364,7 +382,7 @@ class HookTests(unittest.TestCase):
 
     def test_fallback_pane_name_uses_terminal_title(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             agent={
@@ -394,7 +412,7 @@ class HookTests(unittest.TestCase):
 
     def test_http_500(self):
         self._write_env(path="/fail")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             agent=API,
@@ -417,7 +435,7 @@ class HookTests(unittest.TestCase):
 
     def test_lookup_failure_still_posts_with_stderr(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(_event(), herdr_bin="/nonexistent/herdr-bin")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
@@ -435,7 +453,7 @@ class HookTests(unittest.TestCase):
 
     def test_herdr_snake_case_event_envelope_posts(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         envelope = json.dumps(
             {
                 "event": "pane_agent_status_changed",
@@ -466,7 +484,7 @@ class HookTests(unittest.TestCase):
             f"WEBHOOK_KEY={FAKE_KEY}\n",
             encoding="utf-8",
         )
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             agent=API,
@@ -502,7 +520,7 @@ class HookTests(unittest.TestCase):
         self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
-    def test_idle_then_done_posts(self):
+    def test_idle_then_done_does_not_post(self):
         self._write_env()
         self._write_status({"w1:p1": "idle"})
         proc = self._run(
@@ -510,10 +528,8 @@ class HookTests(unittest.TestCase):
             agent=API,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(len(self.server.requests), 1)
-        payload = json.loads(self.server.requests[0]["body"])
-        self.assertEqual(payload["status"], "done")
-        self._assert_pane("done", "done")
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
         self._assert_no_secrets(proc)
 
     def test_done_then_done_does_not_post(self):
@@ -551,7 +567,7 @@ class HookTests(unittest.TestCase):
 
     def test_proxy_env_does_not_divert_localhost(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             extra_env={
@@ -573,12 +589,12 @@ class HookTests(unittest.TestCase):
         self._write_status({"w1:p1": "idle"})
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(len(self.server.requests), 1)
-        self._assert_pane("done", "done")
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
         proc = self._run(_event(agent_status="working"), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(len(self.server.requests), 1)
-        self._assert_pane("working", "done")
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("working", None)
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
@@ -587,7 +603,7 @@ class HookTests(unittest.TestCase):
 
     def test_done_then_done_one_post_total(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self._run(_event(), agent=API)
@@ -611,12 +627,14 @@ class HookTests(unittest.TestCase):
 
     def test_done_idle_done_posts_twice(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self._run(_event(agent_status="idle"), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self._assert_pane("idle", None)
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 2)
@@ -625,9 +643,9 @@ class HookTests(unittest.TestCase):
         self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
-    def test_done_then_blocked_posts(self):
+    def test_working_then_blocked_posts(self):
         self._write_env()
-        self._write_status({"w1:p1": "done"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(agent_status="blocked"),
             agent=API,
@@ -656,6 +674,8 @@ class HookTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("idle", None)
         self._write_env()
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 2)
@@ -664,7 +684,7 @@ class HookTests(unittest.TestCase):
 
     def test_failed_post_releases_claim_so_next_done_retries(self):
         self._write_env(path="/fail")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 1)
         self._assert_pane("done", None)
@@ -680,7 +700,7 @@ class HookTests(unittest.TestCase):
 
     def test_overlapping_done_working_done_posts_once(self):
         self._write_env(path="/slow")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         first = self._start(_event(), agent=API)
         time.sleep(0.7)
         self._assert_pane("done", "done")
@@ -697,7 +717,7 @@ class HookTests(unittest.TestCase):
 
     def test_failed_post_does_not_release_a_newer_claim(self):
         self._write_env(path="/slow-fail")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         first = self._start(_event(), agent=API)
         second = None
         try:
@@ -707,6 +727,8 @@ class HookTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self._assert_pane("idle", None)
             self._write_env()
+            proc = self._run(_event(agent_status="working"), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
             second = self._start(_event(), agent=API)
             deadline = time.time() + 5
             while time.time() < deadline:
@@ -739,7 +761,7 @@ class HookTests(unittest.TestCase):
 
     def test_idle_during_in_flight_post_from_idle_is_not_rewound(self):
         self._write_env(path="/slow")
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         first = self._start(_event(), agent=API)
         time.sleep(0.7)
         proc = self._run(_event(agent_status="idle"), agent=API)
@@ -764,13 +786,19 @@ class HookTests(unittest.TestCase):
         self._assert_pane("unknown", None)
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_transient_done_does_not_post(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             extra_env={"SETTLE_MS": "80"},
@@ -784,7 +812,7 @@ class HookTests(unittest.TestCase):
 
     def test_stable_done_posts_after_settle(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         proc = self._run(
             _event(),
             extra_env={"SETTLE_MS": "80"},
@@ -825,6 +853,8 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
         self._assert_pane("idle", None)
+        proc = self._run(_event(agent_status="working"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self._run(_event(), agent=API)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
@@ -833,7 +863,7 @@ class HookTests(unittest.TestCase):
 
     def test_settle_ms_zero_posts_without_live_confirm(self):
         self._write_env()
-        self._write_status({"w1:p1": "idle"})
+        self._write_status({"w1:p1": "working"})
         started = time.monotonic()
         proc = self._run(
             _event(),
@@ -846,6 +876,131 @@ class HookTests(unittest.TestCase):
         self._assert_pane("done", "done")
         self.assertLess(elapsed, 1.0)
         self.assertNotIn("settle unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_mid_window_flip_does_not_post(self):
+        # A single end-of-window sample (old 2.5s settle) would see done
+        # and POST. Mid-window working must abort.
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={
+                "SETTLE_MS": "80",
+                **self._seq_env(["done", "done", "working", "done"]),
+            },
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self.assertIn("settle unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_thinking_title_blocks_post(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            agent={
+                **API,
+                "agent_status": "done",
+                "terminal_title_stripped": "Thinking",
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self.assertIn("settle unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_title_field_thinking_blocks_post(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            agent={**API, "agent_status": "done", "title": "Thinking"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self._assert_no_secrets(proc)
+
+    def test_mid_run_title_markers_block_post(self):
+        self._write_env()
+        for title in (
+            "Responding",
+            "Waiting for response",
+            "Running",
+            "Tool call",
+        ):
+            with self.subTest(title=title):
+                self.server.requests.clear()
+                self._write_status({"w1:p1": "working"})
+                proc = self._run(
+                    _event(),
+                    agent={
+                        **API,
+                        "agent_status": "done",
+                        "terminal_title_stripped": title,
+                    },
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.server.requests, [])
+                self._assert_pane("done", None)
+
+    def test_working_then_done_sustained_posts(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "80"},
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_idle_mid_window_flicker_keeps_posted(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(
+            _event(agent_status="idle"),
+            extra_env={
+                "SETTLE_MS": "80",
+                **self._seq_env(["idle", "idle", "working", "idle"]),
+            },
+            agent={**API, "agent_status": "idle"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("idle", "done")
+        self._assert_no_secrets(proc)
+
+    def test_unknown_then_done_does_not_post(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "unknown", "posted": None}})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self._assert_no_secrets(proc)
+
+    def test_settle_ms_zero_fast_path_does_not_wait(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        started = time.monotonic()
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "0"},
+            agent={**API, "agent_status": "done"},
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertLess(elapsed, 1.0)
         self._assert_no_secrets(proc)
 
 
