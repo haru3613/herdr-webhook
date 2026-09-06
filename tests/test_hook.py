@@ -218,6 +218,7 @@ class HookTests(unittest.TestCase):
             "https_proxy",
             "all_proxy",
             "SETTLE_MS",
+            "SETTLE_ROUNDS",
         ):
             env.pop(key, None)
         env["NO_PROXY"] = "*"
@@ -808,6 +809,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.server.requests, [])
         self._assert_pane("done", None)
         self.assertIn("settle unconfirmed", proc.stderr)
+        self.assertNotIn("claimed done POST", proc.stderr)
         self._assert_no_secrets(proc)
 
     def test_stable_done_posts_after_settle(self):
@@ -867,7 +869,7 @@ class HookTests(unittest.TestCase):
         started = time.monotonic()
         proc = self._run(
             _event(),
-            extra_env={"SETTLE_MS": "0"},
+            extra_env={"SETTLE_MS": "0", "SETTLE_ROUNDS": "2"},
             agent={**API, "agent_status": "working"},
         )
         elapsed = time.monotonic() - started
@@ -933,6 +935,9 @@ class HookTests(unittest.TestCase):
             "Waiting for response",
             "Running",
             "Tool call",
+            "Writing edit",
+            "Tool",
+            "Summarized",
         ):
             with self.subTest(title=title):
                 self.server.requests.clear()
@@ -993,7 +998,7 @@ class HookTests(unittest.TestCase):
         started = time.monotonic()
         proc = self._run(
             _event(),
-            extra_env={"SETTLE_MS": "0"},
+            extra_env={"SETTLE_MS": "0", "SETTLE_ROUNDS": "2"},
             agent={**API, "agent_status": "done"},
         )
         elapsed = time.monotonic() - started
@@ -1001,6 +1006,54 @@ class HookTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("done", "done")
         self.assertLess(elapsed, 1.0)
+        self.assertIn("claimed done POST for w1:p1", proc.stderr)
+        self.assertNotIn("settle unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_round_two_mid_gap_flip_does_not_post(self):
+        # Lookup + round 1 (3 samples) stay done. Round 2's first sample
+        # flips to working. One round would POST; two must abort.
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={
+                "SETTLE_MS": "80",
+                "SETTLE_ROUNDS": "2",
+                **self._seq_env(["done", "done", "done", "done", "working"]),
+            },
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self.assertIn("settle unconfirmed for w1:p1", proc.stderr)
+        self.assertNotIn("claimed done POST", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_both_settle_rounds_pass_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "80", "SETTLE_ROUNDS": "2"},
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        payload = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(payload["status"], "done")
+        self._assert_pane("done", "done")
+        self.assertIn("claimed done POST for w1:p1", proc.stderr)
+        self.assertNotIn("settle unconfirmed", proc.stderr)
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "80", "SETTLE_ROUNDS": "2"},
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
 

@@ -31,13 +31,16 @@ DEFAULT_STATUSES = ("done", "blocked")
 # (incl Grok) emit turn-level done, so a turn gap looks like a finished job.
 # Do not invent a sidecar EXIT protocol.
 DEFAULT_SETTLE_MS = 10000
+DEFAULT_SETTLE_ROUNDS = 2
 SETTLE_SAMPLES = 3
 MID_RUN_TITLE_MARKERS = (
     "thinking",
     "responding",
     "waiting for response",
     "running",
-    "tool call",
+    "writing edit",
+    "tool",
+    "summarized",
 )
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
 STATUS_FILENAME = "last-status.json"
@@ -79,6 +82,19 @@ def _settle_ms(raw: str) -> int:
         return DEFAULT_SETTLE_MS
     if value < 0:
         return DEFAULT_SETTLE_MS
+    return value
+
+
+def _settle_rounds(raw: str) -> int:
+    text = raw.strip()
+    if not text:
+        return DEFAULT_SETTLE_ROUNDS
+    try:
+        value = int(text)
+    except ValueError:
+        return DEFAULT_SETTLE_ROUNDS
+    if value < 1:
+        return DEFAULT_SETTLE_ROUNDS
     return value
 
 
@@ -530,6 +546,9 @@ def main() -> int:
     dry_run = _truthy(os.environ.get("WEBHOOK_DRY_RUN") or cfg.get("WEBHOOK_DRY_RUN") or "")
     configured = dry_run or bool(webhook_url and webhook_key)
     settle_ms = _settle_ms(os.environ.get("SETTLE_MS") or cfg.get("SETTLE_MS") or "")
+    settle_rounds = _settle_rounds(
+        os.environ.get("SETTLE_ROUNDS") or cfg.get("SETTLE_ROUNDS") or ""
+    )
 
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
@@ -596,9 +615,17 @@ def main() -> int:
                 return 0
 
     if needs_confirm:
-        if not _status_settled(
-            pane_id, status, settle_ms, check_title=should_post
-        ):
+        # Notify POSTs need SETTLE_ROUNDS consecutive windows. Idle/unknown
+        # latch-clear stays one window. SETTLE_MS=0 never reaches here.
+        rounds = settle_rounds if should_post else 1
+        confirmed = True
+        for _ in range(rounds):
+            if not _status_settled(
+                pane_id, status, settle_ms, check_title=should_post
+            ):
+                confirmed = False
+                break
+        if not confirmed:
             print(f"settle unconfirmed for {pane_id}", file=sys.stderr)
             with _status_lock(status_path):
                 store = _load_or_seed_statuses(status_path, notify)
@@ -625,6 +652,7 @@ def main() -> int:
 
     if not pending_http:
         return 0
+    print(f"claimed {status} POST for {pane_id}", file=sys.stderr)
 
     payload = {
         "event": EVENT_NAME,
