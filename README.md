@@ -2,7 +2,7 @@
 
 Herdr already knows when a pane is done or blocked. This plugin POSTs that change as JSON to a URL you own.
 
-POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen` and `posted` per pane. working does not clear `posted`, so done then working then done is one POST. A done or blocked POST requires a prior `seen` of working or blocked. First sighting of a pane is stored and skipped, and unknown or idle into done does not POST. Before a done or blocked POST, the hook samples live `herdr agent get` at least 3 times across SETTLE_MS (default 10000), and repeats that window SETTLE_ROUNDS times (default 2) back-to-back. Every sample must still equal the event status. One flip in any round aborts, records `seen`, and does not POST. If `terminal_title_stripped` or `title` from that get still looks mid-run (thinking, responding, waiting for response, running, writing edit, tool, summarized), treat it as unsettled and do not POST. idle or unknown clears `posted` only after the same multi-sample confirm still reads idle or unknown, so a brief idle flicker does not reopen the latch. SETTLE_MS=0 skips the wait and extra samples (one immediate check total, for tests). If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated. `posted` is claimed before the POST goes out, so overlapping hook runs for the same pane cannot both fire. If the POST fails, that run's claim is cleared and the next transition into that status retries. A newer overlapping claim is left alone.
+POSTs when a pane changes into a notify status (done or blocked by default) that has not already been posted for that pane. last-status.json stores `seen`, `posted`, and `working_since` per pane. working does not clear `posted`, so done then working then done is one POST. A done or blocked POST requires a prior `seen` of working or blocked. First sighting of a pane is stored and skipped, and unknown or idle into done does not POST. `working_since` is stamped when seen becomes working and is required for a done or blocked POST unless MIN_WORKING_MS=0. The POST is refused until that stamp is at least MIN_WORKING_MS old (default 30000). It is cleared after a successful done POST and on unknown. Before a done or blocked POST, the hook samples live `herdr agent get` at least 3 times across SETTLE_MS (default 20000), and repeats that window SETTLE_ROUNDS times (default 3) back-to-back. Every sample must still equal the event status. One flip in any round aborts, records `seen`, and does not POST. If `terminal_title_stripped` or `title` from that get still looks mid-run (thinking, responding, waiting for response, running, writing edit, tool, summarized), treat it as unsettled and do not POST. idle or unknown clears `posted` only after the same multi-sample confirm still reads idle or unknown, so a brief idle flicker does not reopen the latch. SETTLE_MS=0 skips the wait and extra samples (one immediate check total, for tests) and can be paired with MIN_WORKING_MS=0. If the file is missing, the hook seeds it from `herdr agent list` so leftover events for panes that are already done or blocked stay quiet. An older file that stored only the last status is migrated. `posted` is claimed before the POST goes out, so overlapping hook runs for the same pane cannot both fire. If the POST fails, that run's claim is cleared and the next transition into that status retries. A newer overlapping claim is left alone.
 
 Requires Herdr 0.7.5 or newer and `python3` on linux or macOS.
 
@@ -33,8 +33,9 @@ WEBHOOK_KEY_HEADER=
 NOTIFY_STATUSES=done,blocked
 SKIP_PANES=
 WEBHOOK_DRY_RUN=0
-SETTLE_MS=10000
-SETTLE_ROUNDS=2
+SETTLE_MS=20000
+SETTLE_ROUNDS=3
+MIN_WORKING_MS=30000
 EOF
 ```
 
@@ -52,11 +53,13 @@ That writes the file even if your shell is not in the plugin checkout. If you cl
 
 **WEBHOOK_DRY_RUN.** `1` prints the JSON to stdout and skips the POST.
 
-**SETTLE_MS.** Milliseconds spanning the live-status samples before claiming a done or blocked POST, and before idle or unknown clears `posted`. Default 10000. Three samples at the start, middle, and end of this window; one flip aborts. `0` skips the wait and extra samples (one immediate check total). Set it in `.env` or the process environment.
+**SETTLE_MS.** Milliseconds spanning the live-status samples before claiming a done or blocked POST, and before idle or unknown clears `posted`. Default 20000. Three samples at the start, middle, and end of this window; one flip aborts. `0` skips the wait and extra samples (one immediate check total). Set it in `.env` or the process environment.
 
-**SETTLE_ROUNDS.** How many SETTLE_MS windows must pass back-to-back before a done or blocked POST is claimed. Default 2. One failed round aborts. Ignored when SETTLE_MS=0. Idle or unknown latch-clear stays one window.
+**SETTLE_ROUNDS.** How many SETTLE_MS windows must pass back-to-back before a done or blocked POST is claimed. Default 3 (~60s sustained with the default SETTLE_MS). One failed round aborts. Ignored when SETTLE_MS=0. Idle or unknown latch-clear stays one window.
 
-**NOTE.** SETTLE_MS re-check is a stopgap. Herdr 0.8.2 and preview plugins expose only `pane.agent_status_changed`. There is no job-level settle, session-end, or run-finished event. Screen-manifest agents, including Grok, emit turn-level done, so a turn gap looks like a finished job. Upgrade this when Herdr ships a cleaner job-level signal. Do not invent a sidecar EXIT file.
+**MIN_WORKING_MS.** Minimum time the pane must have been `working` before a done or blocked POST. Default 30000. The latch stores `working_since` (unix seconds) when seen becomes working. Refuse the POST unless that stamp is set and `(now - working_since) * 1000 >= MIN_WORKING_MS`. Cleared after a successful done POST and on unknown. `0` skips the floor (use with SETTLE_MS=0 for tests). Set it in `.env` or the process environment.
+
+**NOTE.** SETTLE_MS re-check is a stopgap. Herdr 0.8.2 and preview plugins expose only `pane.agent_status_changed`. There is no job-level settle, session-end, or run-finished event. Screen-manifest agents, including Grok, emit turn-level done, so a turn gap looks like a finished job. 7b096c0 (2x10s dual rounds) missed zed-llm-audit: ~22s quiet done, title was the plain job name so the title guard did not fire, both rounds passed, latch posted=done, step9-llm-audit.md still missing, Zed still mid-job. Window is now 3x20s plus MIN_WORKING_MS. Still a stopgap until Herdr ships a job-level signal. A later per-job artifact gate is optional. Do not invent a sidecar EXIT file.
 
 A missing `.env`, an empty URL, or an empty key makes the hook exit 0. An installed plugin with no config stays quiet.
 

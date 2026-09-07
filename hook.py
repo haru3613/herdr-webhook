@@ -29,9 +29,12 @@ DEFAULT_STATUSES = ("done", "blocked")
 # Stopgap until Herdr ships a job-level settle / session-end / run-finished
 # signal. Today only pane.agent_status_changed exists; screen-manifest agents
 # (incl Grok) emit turn-level done, so a turn gap looks like a finished job.
+# 7b096c0 (2x10s) missed zed-llm-audit: ~22s quiet done, clean title, both
+# rounds passed. Window is 3x20s. Optional later: per-job artifact gate.
 # Do not invent a sidecar EXIT protocol.
-DEFAULT_SETTLE_MS = 10000
-DEFAULT_SETTLE_ROUNDS = 2
+DEFAULT_SETTLE_MS = 20000
+DEFAULT_SETTLE_ROUNDS = 3
+DEFAULT_MIN_WORKING_MS = 30000
 SETTLE_SAMPLES = 3
 MID_RUN_TITLE_MARKERS = (
     "thinking",
@@ -98,6 +101,19 @@ def _settle_rounds(raw: str) -> int:
     return value
 
 
+def _min_working_ms(raw: str) -> int:
+    text = raw.strip()
+    if not text:
+        return DEFAULT_MIN_WORKING_MS
+    try:
+        value = int(text)
+    except ValueError:
+        return DEFAULT_MIN_WORKING_MS
+    if value < 0:
+        return DEFAULT_MIN_WORKING_MS
+    return value
+
+
 def _live_agent_status(info: dict) -> str:
     return _as_status(info.get("agent_status"))
 
@@ -128,7 +144,8 @@ def _sample_matches(info: dict, status: str, check_title: bool) -> bool:
 def _status_settled(
     pane_id: str, status: str, settle_ms: int, *, check_title: bool = False
 ) -> bool:
-    # Confirm live herdr agent get still matches. Drop this wait when Herdr
+    # Confirm live herdr agent get still matches. 7b096c0's 2x10s window
+    # missed zed-llm-audit (~22s quiet done). Drop this wait when Herdr
     # adds a real job-level settle; do not invent a sidecar EXIT protocol.
     # SETTLE_MS=0: one immediate pass, no extra samples (fast tests).
     if settle_ms <= 0:
@@ -221,11 +238,16 @@ def _as_status(value) -> str:
 
 
 def _pane_state(
-    seen: str, posted: str | None, claim: int = 0
+    seen: str,
+    posted: str | None,
+    claim: int = 0,
+    working_since: int | None = None,
 ) -> dict[str, str | int | None]:
     state: dict[str, str | int | None] = {"seen": seen, "posted": posted}
     if claim:
         state["claim"] = claim
+    if working_since:
+        state["working_since"] = working_since
     return state
 
 
@@ -234,6 +256,42 @@ def _claim_n(record: dict | None) -> int:
         return 0
     n = record.get("claim")
     return n if type(n) is int and n > 0 else 0
+
+
+def _working_since_n(record: dict | None) -> int | None:
+    if not record:
+        return None
+    n = record.get("working_since")
+    return n if type(n) is int and n > 0 else None
+
+
+def _next_working_since(record: dict | None, status: str) -> int | None:
+    # Stamp unix seconds when seen becomes working. Keep across idle/blocked
+    # and unconfirmed done. Clear on unknown. Done POST clears after success.
+    if status == "unknown":
+        return None
+    existing = _working_since_n(record)
+    if status == "working":
+        return existing or int(time.time())
+    return existing
+
+
+def _min_working_ok(record: dict | None, min_working_ms: int) -> bool:
+    # SETTLE_MS=0 tests set MIN_WORKING_MS=0 to skip. Otherwise refuse
+    # done/blocked unless working_since is set and aged past the floor.
+    if min_working_ms <= 0:
+        return True
+    ws = _working_since_n(record)
+    if not ws:
+        return False
+    return (int(time.time()) - ws) * 1000 >= min_working_ms
+
+
+def _abort_pane_state(
+    record: dict[str, str | int | None] | None, status: str
+) -> dict[str, str | int | None]:
+    posted = record.get("posted") if record else None
+    return _pane_state(status, posted, _claim_n(record), _working_since_n(record))
 
 
 def _posted_for_seen(status: str, notify: set[str]) -> str | None:
@@ -258,7 +316,7 @@ def _coerce_pane_state(
     if not seen:
         return None
     posted = _as_status(value.get("posted")) or None
-    return _pane_state(seen, posted, _claim_n(value))
+    return _pane_state(seen, posted, _claim_n(value), _working_since_n(value))
 
 
 def _normalize_status_store(
@@ -375,7 +433,11 @@ def _load_or_seed_statuses(
                 return _normalize_status_store(raw, notify)
     seeded: dict[str, dict[str, str | int | None]] = {}
     for pane_id, status in _agent_list_statuses().items():
-        seeded[pane_id] = _pane_state(status, _posted_for_seen(status, notify))
+        seeded[pane_id] = _pane_state(
+            status,
+            _posted_for_seen(status, notify),
+            working_since=_next_working_since(None, status),
+        )
     _persist_store(path, seeded)
     return dict(seeded)
 
@@ -412,7 +474,9 @@ def _next_pane_state(
         new_posted = _posted_for_seen(status, notify)
     else:
         new_posted = posted
-    return _pane_state(status, new_posted, claim)
+    return _pane_state(
+        status, new_posted, claim, _next_working_since(record, status)
+    )
 
 
 def _release_claim(
@@ -426,7 +490,30 @@ def _release_claim(
             return
         if _claim_n(current) != claim:
             return
-        store[pane_id] = _pane_state(current["seen"], None, claim)
+        store[pane_id] = _pane_state(
+            current["seen"], None, claim, _working_since_n(current)
+        )
+        _persist_store(path, store)
+
+
+def _clear_working_since_if_claim(
+    path: str, pane_id: str, status: str, notify: set[str], claim: int
+) -> None:
+    """Drop working_since after a successful done POST if this run still owns the latch."""
+    if status != "done" or claim <= 0:
+        return
+    with _status_lock(path):
+        store = _load_or_seed_statuses(path, notify)
+        current = store.get(pane_id)
+        if current is None:
+            return
+        if current.get("seen") != status or current.get("posted") != status:
+            return
+        if _claim_n(current) != claim:
+            return
+        if _working_since_n(current) is None:
+            return
+        store[pane_id] = _pane_state(status, status, claim, working_since=None)
         _persist_store(path, store)
 
 
@@ -549,6 +636,9 @@ def main() -> int:
     settle_rounds = _settle_rounds(
         os.environ.get("SETTLE_ROUNDS") or cfg.get("SETTLE_ROUNDS") or ""
     )
+    min_working_ms = _min_working_ms(
+        os.environ.get("MIN_WORKING_MS") or cfg.get("MIN_WORKING_MS") or ""
+    )
 
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
@@ -586,14 +676,20 @@ def main() -> int:
         record = store.get(pane_id)
         if skipped:
             # Skipped panes track seen only. Never claim posted for them.
-            store[pane_id] = _pane_state(status, None, _claim_n(record))
+            store[pane_id] = _pane_state(
+                status, None, _claim_n(record), _next_working_since(record, status)
+            )
             _persist_store(status_path, store)
             return 0
         should_post = configured and _should_post(record, status, notify)
         should_clear = _should_clear_posted(record, status)
+        if should_post and not _min_working_ok(record, min_working_ms):
+            store[pane_id] = _abort_pane_state(record, status)
+            _persist_store(status_path, store)
+            print(f"min working unconfirmed for {pane_id}", file=sys.stderr)
+            return 0
         if should_post and _title_looks_mid_run(info):
-            posted = record.get("posted") if record else None
-            store[pane_id] = _pane_state(status, posted, _claim_n(record))
+            store[pane_id] = _abort_pane_state(record, status)
             _persist_store(status_path, store)
             print(f"settle unconfirmed for {pane_id}", file=sys.stderr)
             return 0
@@ -601,7 +697,8 @@ def main() -> int:
         if not needs_confirm:
             if should_post:
                 # Claim posted before HTTP so an overlapping run stays quiet.
-                # Success writes nothing; failure releases only this run's claim.
+                # Success only drops working_since if this claim still owns
+                # done; failure releases only this run's claim.
                 nxt = _next_pane_state(record, status, notify, posted_now=True)
                 store[pane_id] = nxt
                 _persist_store(status_path, store)
@@ -615,8 +712,9 @@ def main() -> int:
                 return 0
 
     if needs_confirm:
-        # Notify POSTs need SETTLE_ROUNDS consecutive windows. Idle/unknown
-        # latch-clear stays one window. SETTLE_MS=0 never reaches here.
+        # Notify POSTs need SETTLE_ROUNDS consecutive windows (3x20s after
+        # 7b096c0 missed a ~22s quiet done). Idle/unknown latch-clear stays
+        # one window. SETTLE_MS=0 never reaches here.
         rounds = settle_rounds if should_post else 1
         confirmed = True
         for _ in range(rounds):
@@ -630,14 +728,17 @@ def main() -> int:
             with _status_lock(status_path):
                 store = _load_or_seed_statuses(status_path, notify)
                 record = store.get(pane_id)
-                posted = record.get("posted") if record else None
-                store[pane_id] = _pane_state(status, posted, _claim_n(record))
+                store[pane_id] = _abort_pane_state(record, status)
                 _persist_store(status_path, store)
             return 0
         with _status_lock(status_path):
             store = _load_or_seed_statuses(status_path, notify)
             record = store.get(pane_id)
-            if configured and _should_post(record, status, notify):
+            if (
+                configured
+                and _should_post(record, status, notify)
+                and _min_working_ok(record, min_working_ms)
+            ):
                 nxt = _next_pane_state(record, status, notify, posted_now=True)
                 store[pane_id] = nxt
                 _persist_store(status_path, store)
@@ -669,6 +770,7 @@ def main() -> int:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     if dry_run:
         sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        _clear_working_since_if_claim(status_path, pane_id, status, notify, claimed)
         return 0
 
     url_error = _check_url(webhook_url)
@@ -691,6 +793,8 @@ def main() -> int:
     result = _post(webhook_url, body, headers)
     if result != 0:
         _release_claim(status_path, pane_id, status, notify, claimed)
+    else:
+        _clear_working_since_if_claim(status_path, pane_id, status, notify, claimed)
     return result
 
 

@@ -219,6 +219,7 @@ class HookTests(unittest.TestCase):
             "all_proxy",
             "SETTLE_MS",
             "SETTLE_ROUNDS",
+            "MIN_WORKING_MS",
         ):
             env.pop(key, None)
         env["NO_PROXY"] = "*"
@@ -236,6 +237,8 @@ class HookTests(unittest.TestCase):
             env.update(extra_env)
         if "SETTLE_MS" not in env:
             env["SETTLE_MS"] = "0"
+        if "MIN_WORKING_MS" not in env:
+            env["MIN_WORKING_MS"] = "0"
         return env
 
     def _assert_no_secrets(self, proc: subprocess.CompletedProcess) -> None:
@@ -1054,6 +1057,134 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_dual_rounds_would_pass_third_round_resume_does_not_post(self):
+        # 7b096c0: 2x10s passed a ~22s quiet done (zed-llm-audit). Dual
+        # rounds still POST; resume on the third round must not.
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={
+                "SETTLE_MS": "80",
+                "SETTLE_ROUNDS": "2",
+                **self._seq_env(["done"] * 7),
+            },
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertIn("claimed done POST for w1:p1", proc.stderr)
+
+        self.server.requests.clear()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={
+                "SETTLE_MS": "80",
+                "SETTLE_ROUNDS": "3",
+                **self._seq_env(["done"] * 7 + ["working"]),
+            },
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self.assertIn("settle unconfirmed for w1:p1", proc.stderr)
+        self.assertNotIn("claimed done POST", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_min_working_blocks_instant_done(self):
+        self._write_env()
+        proc = self._run(
+            _event(agent_status="working"),
+            extra_env={"SETTLE_MS": "0", "MIN_WORKING_MS": "30000"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rec = self._read_status().get("w1:p1")
+        self.assertIsInstance(rec, dict, rec)
+        self.assertEqual(rec.get("seen"), "working")
+        self.assertIsInstance(rec.get("working_since"), int)
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "0", "MIN_WORKING_MS": "30000"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        rec = self._read_status().get("w1:p1")
+        self.assertIsInstance(rec, dict, rec)
+        self.assertIsInstance(rec.get("working_since"), int)
+        self.assertIn("min working unconfirmed for w1:p1", proc.stderr)
+        self.assertNotIn("claimed done POST", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_min_working_allows_aged_working_since(self):
+        self._write_env()
+        self._write_status(
+            {
+                "w1:p1": {
+                    "seen": "working",
+                    "posted": None,
+                    "working_since": int(time.time()) - 31,
+                }
+            }
+        )
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "0", "MIN_WORKING_MS": "30000"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        rec = self._read_status().get("w1:p1")
+        self.assertIsInstance(rec, dict, rec)
+        self.assertNotIn("working_since", rec)
+        self._assert_no_secrets(proc)
+
+    def test_settle_ms_zero_and_min_working_zero_fast_path(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        started = time.monotonic()
+        proc = self._run(
+            _event(),
+            extra_env={"SETTLE_MS": "0", "MIN_WORKING_MS": "0", "SETTLE_ROUNDS": "3"},
+            agent={**API, "agent_status": "working"},
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertLess(elapsed, 1.0)
+        self.assertIn("claimed done POST for w1:p1", proc.stderr)
+        self.assertNotIn("settle unconfirmed", proc.stderr)
+        self.assertNotIn("min working unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_unknown_clears_working_since(self):
+        self._write_env()
+        self._write_status(
+            {
+                "w1:p1": {
+                    "seen": "working",
+                    "posted": None,
+                    "working_since": int(time.time()) - 60,
+                }
+            }
+        )
+        proc = self._run(_event(agent_status="unknown"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rec = self._read_status().get("w1:p1")
+        self.assertIsInstance(rec, dict, rec)
+        self.assertEqual(rec.get("seen"), "unknown")
+        self.assertIsNone(rec.get("posted"))
+        self.assertNotIn("working_since", rec)
+        self.assertEqual(self.server.requests, [])
         self._assert_no_secrets(proc)
 
 
