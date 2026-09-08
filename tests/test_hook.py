@@ -220,6 +220,7 @@ class HookTests(unittest.TestCase):
             "SETTLE_MS",
             "SETTLE_ROUNDS",
             "MIN_WORKING_MS",
+            "RETRACT_ON_RESUME",
         ):
             env.pop(key, None)
         env["NO_PROXY"] = "*"
@@ -239,6 +240,8 @@ class HookTests(unittest.TestCase):
             env["SETTLE_MS"] = "0"
         if "MIN_WORKING_MS" not in env:
             env["MIN_WORKING_MS"] = "0"
+        if "RETRACT_ON_RESUME" not in env:
+            env["RETRACT_ON_RESUME"] = "0"
         return env
 
     def _assert_no_secrets(self, proc: subprocess.CompletedProcess) -> None:
@@ -1164,6 +1167,68 @@ class HookTests(unittest.TestCase):
         self.assertIn("claimed done POST for w1:p1", proc.stderr)
         self.assertNotIn("settle unconfirmed", proc.stderr)
         self.assertNotIn("min working unconfirmed", proc.stderr)
+        self._assert_no_secrets(proc)
+
+    def test_resume_after_posted_done_retracts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(
+            _event(agent_status="working"),
+            extra_env={"RETRACT_ON_RESUME": "1"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        payload = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(payload["event"], EVENT_NAME)
+        self.assertEqual(payload["status"], "working")
+        self.assertTrue(payload["retracted"])
+        self.assertEqual(payload["prior_status"], "done")
+        self.assertEqual(payload["pane_id"], "w1:p1")
+        self._assert_pane("working", None)
+        self.assertIn("claimed retract POST for w1:p1", proc.stderr)
+        self.assertNotIn("claimed done POST", proc.stderr)
+        proc = self._run(
+            _event(agent_status="working"),
+            extra_env={"RETRACT_ON_RESUME": "1"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("working", None)
+        proc = self._run(
+            _event(),
+            extra_env={"RETRACT_ON_RESUME": "1"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        done_payload = json.loads(self.server.requests[1]["body"])
+        self.assertEqual(done_payload["status"], "done")
+        self.assertNotIn("retracted", done_payload)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_retract_on_resume_zero_does_not_post(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        proc = self._run(
+            _event(agent_status="working"),
+            extra_env={"RETRACT_ON_RESUME": "0"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("working", "done")
+        self.assertNotIn("claimed retract POST", proc.stderr)
+        proc = self._run(
+            _event(),
+            extra_env={"RETRACT_ON_RESUME": "0"},
+            agent=API,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
     def test_unknown_clears_working_since(self):

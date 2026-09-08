@@ -35,7 +35,9 @@ DEFAULT_STATUSES = ("done", "blocked")
 DEFAULT_SETTLE_MS = 20000
 DEFAULT_SETTLE_ROUNDS = 3
 DEFAULT_MIN_WORKING_MS = 30000
+DEFAULT_RETRACT_ON_RESUME = True
 SETTLE_SAMPLES = 3
+RESUME_STATUSES = frozenset({"working", "blocked"})
 MID_RUN_TITLE_MARKERS = (
     "thinking",
     "responding",
@@ -112,6 +114,13 @@ def _min_working_ms(raw: str) -> int:
     if value < 0:
         return DEFAULT_MIN_WORKING_MS
     return value
+
+
+def _retract_on_resume(raw: str) -> bool:
+    text = raw.strip()
+    if not text:
+        return DEFAULT_RETRACT_ON_RESUME
+    return _truthy(text)
 
 
 def _live_agent_status(info: dict) -> str:
@@ -456,6 +465,29 @@ def _should_post(
     return status in notify and record.get("seen") != status and record.get("posted") != status
 
 
+def _should_retract(
+    record: dict[str, str | int | None] | None,
+    status: str,
+    notify: set[str],
+    enabled: bool,
+) -> bool:
+    # working/blocked after a posted notify means the prior done (or
+    # blocked) was a turn gap, not job end. POST retract and drop posted
+    # so a later real done can fire. RETRACT_ON_RESUME=0 skips this.
+    if not enabled or record is None:
+        return False
+    if status not in RESUME_STATUSES:
+        return False
+    posted = record.get("posted")
+    if not isinstance(posted, str) or not posted:
+        return False
+    if posted == status:
+        return False
+    if posted not in notify and posted != "done":
+        return False
+    return True
+
+
 def _next_pane_state(
     record: dict[str, str | int | None] | None,
     status: str,
@@ -514,6 +546,34 @@ def _clear_working_since_if_claim(
         if _working_since_n(current) is None:
             return
         store[pane_id] = _pane_state(status, status, claim, working_since=None)
+        _persist_store(path, store)
+
+
+def _restore_posted_after_failed_retract(
+    path: str,
+    pane_id: str,
+    notify: set[str],
+    prior_status: str,
+    seen: str,
+) -> None:
+    """Put posted back if this retract POST failed and no one else claimed."""
+    if not prior_status:
+        return
+    with _status_lock(path):
+        store = _load_or_seed_statuses(path, notify)
+        current = store.get(pane_id)
+        if current is None:
+            return
+        if current.get("posted") is not None:
+            return
+        if current.get("seen") != seen:
+            return
+        store[pane_id] = _pane_state(
+            current["seen"],
+            prior_status,
+            _claim_n(current),
+            _working_since_n(current),
+        )
         _persist_store(path, store)
 
 
@@ -639,6 +699,9 @@ def main() -> int:
     min_working_ms = _min_working_ms(
         os.environ.get("MIN_WORKING_MS") or cfg.get("MIN_WORKING_MS") or ""
     )
+    retract_enabled = _retract_on_resume(
+        os.environ.get("RETRACT_ON_RESUME") or cfg.get("RETRACT_ON_RESUME") or ""
+    )
 
     agent = _field(data, raw, "agent")
     display_agent = _field(data, raw, "display_agent")
@@ -670,6 +733,8 @@ def main() -> int:
 
     claimed = 0
     pending_http = False
+    pending_retract = False
+    prior_posted = ""
     needs_confirm = False
     with _status_lock(status_path):
         store = _load_or_seed_statuses(status_path, notify)
@@ -681,8 +746,13 @@ def main() -> int:
             )
             _persist_store(status_path, store)
             return 0
-        should_post = configured and _should_post(record, status, notify)
-        should_clear = _should_clear_posted(record, status)
+        should_retract = configured and _should_retract(
+            record, status, notify, retract_enabled
+        )
+        should_post = (
+            (not should_retract) and configured and _should_post(record, status, notify)
+        )
+        should_clear = (not should_retract) and _should_clear_posted(record, status)
         if should_post and not _min_working_ok(record, min_working_ms):
             store[pane_id] = _abort_pane_state(record, status)
             _persist_store(status_path, store)
@@ -704,6 +774,21 @@ def main() -> int:
                 _persist_store(status_path, store)
                 claimed = _claim_n(nxt)
                 pending_http = True
+            elif should_retract:
+                # Clear posted before the retract POST so overlapping
+                # working events do not double-fire. Restore posted if
+                # this POST fails. Success leaves posted empty.
+                posted = record.get("posted") if record else None
+                prior_posted = posted if isinstance(posted, str) else ""
+                store[pane_id] = _pane_state(
+                    status,
+                    None,
+                    _claim_n(record),
+                    _next_working_since(record, status),
+                )
+                _persist_store(status_path, store)
+                pending_http = True
+                pending_retract = True
             else:
                 store[pane_id] = _next_pane_state(
                     record, status, notify, posted_now=False
@@ -753,7 +838,10 @@ def main() -> int:
 
     if not pending_http:
         return 0
-    print(f"claimed {status} POST for {pane_id}", file=sys.stderr)
+    if pending_retract:
+        print(f"claimed retract POST for {pane_id}", file=sys.stderr)
+    else:
+        print(f"claimed {status} POST for {pane_id}", file=sys.stderr)
 
     payload = {
         "event": EVENT_NAME,
@@ -767,16 +855,25 @@ def main() -> int:
         "display_agent": display_agent or None,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if pending_retract:
+        payload["retracted"] = True
+        payload["prior_status"] = prior_posted
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     if dry_run:
         sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
-        _clear_working_since_if_claim(status_path, pane_id, status, notify, claimed)
+        if not pending_retract:
+            _clear_working_since_if_claim(status_path, pane_id, status, notify, claimed)
         return 0
 
     url_error = _check_url(webhook_url)
     if url_error:
         print(url_error, file=sys.stderr)
-        _release_claim(status_path, pane_id, status, notify, claimed)
+        if pending_retract:
+            _restore_posted_after_failed_retract(
+                status_path, pane_id, notify, prior_posted, status
+            )
+        else:
+            _release_claim(status_path, pane_id, status, notify, claimed)
         return 1
 
     headers = {
@@ -788,12 +885,22 @@ def main() -> int:
             headers[extra_header] = webhook_key
         else:
             print("invalid WEBHOOK_KEY_HEADER", file=sys.stderr)
-            _release_claim(status_path, pane_id, status, notify, claimed)
+            if pending_retract:
+                _restore_posted_after_failed_retract(
+                    status_path, pane_id, notify, prior_posted, status
+                )
+            else:
+                _release_claim(status_path, pane_id, status, notify, claimed)
             return 1
     result = _post(webhook_url, body, headers)
     if result != 0:
-        _release_claim(status_path, pane_id, status, notify, claimed)
-    else:
+        if pending_retract:
+            _restore_posted_after_failed_retract(
+                status_path, pane_id, notify, prior_posted, status
+            )
+        else:
+            _release_claim(status_path, pane_id, status, notify, claimed)
+    elif not pending_retract:
         _clear_working_since_if_claim(status_path, pane_id, status, notify, claimed)
     return result
 
