@@ -143,7 +143,9 @@ def _title_looks_mid_run(info: dict) -> bool:
 def _sample_matches(info: dict, status: str, check_title: bool) -> bool:
     if not info:
         return False
-    if _live_agent_status(info) != status:
+    live = _live_agent_status(info)
+    # Viewing a done pane turns it idle; the turn is still finished.
+    if live != status and not (status == "done" and live == "idle"):
         return False
     if check_title and _title_looks_mid_run(info):
         return False
@@ -739,6 +741,10 @@ def main() -> int:
     with _status_lock(status_path):
         store = _load_or_seed_statuses(status_path, notify)
         record = store.get(pane_id)
+        if status == "idle" and "done" in notify and record and record.get("seen") == "working":
+            # Herdr reports a turn that ends in an already-seen (focused) pane
+            # as idle, not done. Straight from working, that is still job end.
+            status = "done"
         if skipped:
             # Skipped panes track seen only. Never claim posted for them.
             store[pane_id] = _pane_state(
