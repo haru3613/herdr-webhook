@@ -1209,6 +1209,43 @@ class HookTests(unittest.TestCase):
         self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
+    def test_seen_completion_after_retract_posts_done(self):
+        # A focused pane finishes as working -> idle; Herdr never says done.
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        env = {"RETRACT_ON_RESUME": "1"}
+        proc = self._run(_event(agent_status="working"), extra_env=env, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        proc = self._run(
+            _event(agent_status="idle"),
+            extra_env=env,
+            agent={**API, "agent_status": "idle"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        payload = json.loads(self.server.requests[1]["body"])
+        self.assertEqual(payload["status"], "done")
+        self.assertNotIn("retracted", payload)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_done_viewed_during_settle_still_posts(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(
+            _event(),
+            extra_env={
+                "SETTLE_MS": "80",
+                **self._seq_env(["done", "idle", "idle", "idle"]),
+            },
+            agent={**API, "agent_status": "done"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
     def test_retract_on_resume_zero_does_not_post(self):
         self._write_env()
         self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
