@@ -49,6 +49,8 @@ MID_RUN_TITLE_MARKERS = (
 )
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
 STATUS_FILENAME = "last-status.json"
+PLUGIN_ID = "jefflau.herdr-webhook"
+STOP_MESSAGE_LIMIT = 4000
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -913,5 +915,131 @@ def main() -> int:
     return result
 
 
+def _stop_config_dir() -> str:
+    got = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or ""
+    if got:
+        return got
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    try:
+        proc = subprocess.run(
+            [herdr, "plugin", "config-dir", PLUGIN_ID],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def stop_main(agent: str) -> int:
+    """Claude Code / Codex Stop hook: POST done now, no settle.
+
+    The agent itself says its turn ended, so there is nothing to guess. Claim
+    the shared latch first so the settled plugin run for this turn stays quiet
+    and a later working event still retracts. Always exit 0: stdout and the
+    exit code belong to the agent's hook protocol, never block its stop.
+    """
+    pane_id = _text(os.environ.get("HERDR_PANE_ID"))
+    if os.environ.get("HERDR_ENV") != "1" or not pane_id:
+        return 0
+    try:
+        hook_input = json.load(sys.stdin)
+    except (OSError, ValueError):
+        hook_input = {}
+    if not isinstance(hook_input, dict):
+        hook_input = {}
+    if hook_input.get("stop_hook_active") is True:
+        # Claude is continuing because a Stop hook blocked; the turn is not over.
+        return 0
+
+    config_dir = _stop_config_dir()
+    env_path = os.path.join(config_dir, ".env") if config_dir else ""
+    if not env_path or not os.path.isfile(env_path):
+        return 0
+    try:
+        cfg = _load_env(env_path)
+    except OSError:
+        return 0
+    webhook_url = cfg.get("WEBHOOK_URL", "").strip()
+    webhook_key = cfg.get("WEBHOOK_KEY", "").strip()
+    extra_header = cfg.get("WEBHOOK_KEY_HEADER", "").strip()
+    dry_run = _truthy(os.environ.get("WEBHOOK_DRY_RUN") or cfg.get("WEBHOOK_DRY_RUN") or "")
+    if not dry_run and not (webhook_url and webhook_key):
+        return 0
+    notify = _notify_statuses(cfg.get("NOTIFY_STATUSES") or "")
+    if "done" not in notify:
+        return 0
+
+    info = _agent_get(pane_id)
+    name = _text(info.get("name"))
+    display_agent = _text(info.get("display_agent"))
+    pane_name = name or _text(info.get("terminal_title_stripped")) or display_agent
+    if _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or "")):
+        return 0
+
+    status_path = os.path.join(config_dir, STATUS_FILENAME)
+    with _status_lock(status_path):
+        store = _load_or_seed_statuses(status_path, notify)
+        prior = store.get(pane_id)
+        claimed = _claim_n(prior) + 1
+        store[pane_id] = _pane_state("done", "done", claimed)
+        _persist_store(status_path, store)
+
+    message = _text(hook_input.get("last_assistant_message"))
+    payload = {
+        "event": EVENT_NAME,
+        "status": "done",
+        "pane_id": pane_id,
+        "pane_name": pane_name,
+        "workspace_id": _text(os.environ.get("HERDR_WORKSPACE_ID")) or _text(info.get("workspace_id")),
+        "workspace_label": "",
+        "cwd": _text(hook_input.get("cwd")) or _text(info.get("cwd")),
+        "agent": agent or _text(info.get("agent")),
+        "display_agent": display_agent or None,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "stop_hook",
+        "session_id": _text(hook_input.get("session_id")),
+        "last_assistant_message": message[:STOP_MESSAGE_LIMIT],
+    }
+    if len(message) > STOP_MESSAGE_LIMIT:
+        payload["last_assistant_message_truncated"] = True
+    body = json.dumps(payload, separators=(",", ":"))
+    print(f"claimed done POST for {pane_id} (stop hook)", file=sys.stderr)
+    if dry_run:
+        print(body, file=sys.stderr)
+        return 0
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {webhook_key}",
+    }
+    error = _check_url(webhook_url)
+    if not error and extra_header:
+        if HEADER_NAME.fullmatch(extra_header):
+            headers[extra_header] = webhook_key
+        else:
+            error = "invalid WEBHOOK_KEY_HEADER"
+    if error:
+        print(error, file=sys.stderr)
+    elif _post(webhook_url, body.encode("utf-8"), headers) == 0:
+        return 0
+    # Hand the turn back to the settled plugin run: restore the latch this
+    # run replaced, unless a newer claim already moved it.
+    with _status_lock(status_path):
+        store = _load_or_seed_statuses(status_path, notify)
+        current = store.get(pane_id)
+        if current and current.get("posted") == "done" and _claim_n(current) == claimed:
+            if prior is None:
+                store.pop(pane_id, None)
+            else:
+                store[pane_id] = prior
+            _persist_store(status_path, store)
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["stop"]:
+        sys.exit(stop_main(sys.argv[2] if len(sys.argv) > 2 else ""))
     sys.exit(main())
