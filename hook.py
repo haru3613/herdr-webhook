@@ -786,11 +786,13 @@ def main() -> int:
                 # this POST fails. Success leaves posted empty.
                 posted = record.get("posted") if record else None
                 prior_posted = posted if isinstance(posted, str) else ""
+                # The retracted job already ran past the floor; a short
+                # resumed turn must still post the done that closes it.
                 store[pane_id] = _pane_state(
                     status,
                     None,
                     _claim_n(record),
-                    _next_working_since(record, status),
+                    int(time.time()) - min_working_ms // 1000 - 1,
                 )
                 _persist_store(status_path, store)
                 pending_http = True

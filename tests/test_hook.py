@@ -1230,6 +1230,24 @@ class HookTests(unittest.TestCase):
         self._assert_pane("done", "done")
         self._assert_no_secrets(proc)
 
+    def test_short_turn_after_retract_still_posts_done(self):
+        # The retract told the receiver the job resumed; a short follow-up
+        # turn must still close it, or the receiver waits forever.
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "done", "posted": "done"}})
+        env = {"RETRACT_ON_RESUME": "1", "MIN_WORKING_MS": "30000"}
+        proc = self._run(_event(agent_status="working"), extra_env=env, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        proc = self._run(_event(), extra_env=env, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("min working unconfirmed", proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        payload = json.loads(self.server.requests[1]["body"])
+        self.assertEqual(payload["status"], "done")
+        self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
     def test_done_viewed_during_settle_still_posts(self):
         self._write_env()
         self._write_status({"w1:p1": "working"})
