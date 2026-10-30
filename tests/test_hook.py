@@ -40,6 +40,11 @@ def _handler():
                     "body": body,
                 }
             )
+            if self.path == "/slow-fail-first" and len(self.server.requests) == 1:
+                time.sleep(2.0)
+                self.send_response(500)
+                self.end_headers()
+                return
             if self.path == "/fail":
                 self.send_response(500)
                 self.end_headers()
@@ -1392,6 +1397,57 @@ class HookTests(unittest.TestCase):
         proc = self._run(_event(), agent=API)
         self.assertEqual(len(self.server.requests), 2)
         self._assert_no_secrets(proc)
+
+    def _settling_plugin_done(self) -> subprocess.Popen:
+        return self._start(
+            _event(),
+            extra_env={"SETTLE_MS": "1500", "SETTLE_ROUNDS": "1"},
+            agent={**API, "agent_status": "done"},
+        )
+
+    def test_stop_hook_during_plugin_settle_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        plugin = self._settling_plugin_done()
+        time.sleep(0.4)
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        plugin.communicate(timeout=15)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["source"], "stop_hook")
+        self._assert_pane("done", "done")
+
+    def test_failed_stop_hook_during_plugin_settle_still_delivers(self):
+        # A failed stop POST must not swallow the settled plugin run.
+        # The stop POST fails only after the plugin's post-settle check (1.5s).
+        self._write_env(path="/slow-fail-first")
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        plugin = self._settling_plugin_done()
+        time.sleep(0.4)
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        plugin.communicate(timeout=15)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertNotIn("source", json.loads(self.server.requests[1]["body"]))
+        self._assert_pane("done", "done")
+
+    def test_stop_hook_bad_input_still_exits_zero(self):
+        self._write_env()
+        env = self._env("", extra_env=None, agent=API, herdr_bin=None)
+        env.update({"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"})
+        deep = "[" * 200000 + "]" * 200000
+        proc = subprocess.run(
+            [sys.executable, str(HOOK), "stop", "claude"],
+            input=deep, capture_output=True, text=True, env=env, timeout=15, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        (self.config / ".env").write_bytes(b"WEBHOOK_URL=http://127.0.0.1:9/h\nWEBHOOK_KEY=\xff\xfe\n")
+        proc = subprocess.run(
+            [sys.executable, str(HOOK), "stop", "claude"],
+            input="{}", capture_output=True, text=True, env=env, timeout=15, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertNotIn("Traceback", proc.stderr)
 
     def test_stop_hook_outside_herdr_pane_is_noop(self):
         self._write_env()

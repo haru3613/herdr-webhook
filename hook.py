@@ -936,10 +936,13 @@ def _stop_config_dir() -> str:
 def stop_main(agent: str) -> int:
     """Claude Code / Codex Stop hook: POST done now, no settle.
 
-    The agent itself says its turn ended, so there is nothing to guess. Claim
-    the shared latch first so the settled plugin run for this turn stays quiet
-    and a later working event still retracts. Always exit 0: stdout and the
-    exit code belong to the agent's hook protocol, never block its stop.
+    The agent itself says its turn ended, so there is nothing to guess. Latch
+    posted=done only after a successful POST: the settled plugin run for this
+    turn (~60s later) then stays quiet and a later working event still
+    retracts, while a failed POST leaves the latch untouched for the plugin
+    to deliver. Claiming before the POST would let a failure swallow the
+    plugin run. Always exit 0: stdout and the exit code belong to the agent's
+    hook protocol, never block its stop.
     """
     pane_id = _text(os.environ.get("HERDR_PANE_ID"))
     if os.environ.get("HERDR_ENV") != "1" or not pane_id:
@@ -979,14 +982,6 @@ def stop_main(agent: str) -> int:
     if _skip_pane(pane_name, _csv(cfg.get("SKIP_PANES") or "")):
         return 0
 
-    status_path = os.path.join(config_dir, STATUS_FILENAME)
-    with _status_lock(status_path):
-        store = _load_or_seed_statuses(status_path, notify)
-        prior = store.get(pane_id)
-        claimed = _claim_n(prior) + 1
-        store[pane_id] = _pane_state("done", "done", claimed)
-        _persist_store(status_path, store)
-
     message = _text(hook_input.get("last_assistant_message"))
     payload = {
         "event": EVENT_NAME,
@@ -1006,11 +1001,20 @@ def stop_main(agent: str) -> int:
     if len(message) > STOP_MESSAGE_LIMIT:
         payload["last_assistant_message_truncated"] = True
     body = json.dumps(payload, separators=(",", ":"))
-    print(f"claimed done POST for {pane_id} (stop hook)", file=sys.stderr)
     if dry_run:
         print(body, file=sys.stderr)
+    elif not _stop_post(webhook_url, webhook_key, extra_header, body):
         return 0
+    print(f"posted done for {pane_id} (stop hook)", file=sys.stderr)
+    status_path = os.path.join(config_dir, STATUS_FILENAME)
+    with _status_lock(status_path):
+        store = _load_or_seed_statuses(status_path, notify)
+        store[pane_id] = _pane_state("done", "done", _claim_n(store.get(pane_id)) + 1)
+        _persist_store(status_path, store)
+    return 0
 
+
+def _stop_post(webhook_url: str, webhook_key: str, extra_header: str, body: str) -> bool:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {webhook_key}",
@@ -1023,23 +1027,16 @@ def stop_main(agent: str) -> int:
             error = "invalid WEBHOOK_KEY_HEADER"
     if error:
         print(error, file=sys.stderr)
-    elif _post(webhook_url, body.encode("utf-8"), headers) == 0:
-        return 0
-    # Hand the turn back to the settled plugin run: restore the latch this
-    # run replaced, unless a newer claim already moved it.
-    with _status_lock(status_path):
-        store = _load_or_seed_statuses(status_path, notify)
-        current = store.get(pane_id)
-        if current and current.get("posted") == "done" and _claim_n(current) == claimed:
-            if prior is None:
-                store.pop(pane_id, None)
-            else:
-                store[pane_id] = prior
-            _persist_store(status_path, store)
-    return 0
+        return False
+    return _post(webhook_url, body.encode("utf-8"), headers) == 0
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["stop"]:
-        sys.exit(stop_main(sys.argv[2] if len(sys.argv) > 2 else ""))
+        try:
+            stop_main(sys.argv[2] if len(sys.argv) > 2 else "")
+        except Exception as err:
+            # Bad stdin or .env must not surface as a failed agent hook.
+            print(f"stop hook failed: {type(err).__name__}", file=sys.stderr)
+        sys.exit(0)
     sys.exit(main())
