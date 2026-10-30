@@ -40,6 +40,11 @@ def _handler():
                     "body": body,
                 }
             )
+            if self.path == "/slow-fail-first" and len(self.server.requests) == 1:
+                time.sleep(2.0)
+                self.send_response(500)
+                self.end_headers()
+                return
             if self.path == "/fail":
                 self.send_response(500)
                 self.end_headers()
@@ -1306,6 +1311,195 @@ class HookTests(unittest.TestCase):
         self.assertNotIn("working_since", rec)
         self.assertEqual(self.server.requests, [])
         self._assert_no_secrets(proc)
+
+    def _run_stop(
+        self,
+        hook_input: dict,
+        *,
+        extra_env: dict[str, str] | None = None,
+        agent: dict | None = None,
+    ) -> subprocess.CompletedProcess:
+        env = self._env("", extra_env=None, agent=agent, herdr_bin=None)
+        for key in ("HERDR_PLUGIN_EVENT", "HERDR_PLUGIN_EVENT_JSON", "SETTLE_MS", "MIN_WORKING_MS"):
+            env.pop(key, None)
+        env.update({"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"})
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, str(HOOK), "stop", "claude"],
+            input=json.dumps(hook_input),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+            check=False,
+        )
+
+    def test_stop_hook_posts_done_without_settle(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        started = time.monotonic()
+        proc = self._run_stop(
+            {"session_id": "s1", "cwd": "/tmp/src/api", "last_assistant_message": "all done"},
+            agent=API,
+        )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(len(self.server.requests), 1)
+        payload = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(payload["source"], "stop_hook")
+        self.assertEqual(payload["agent"], "claude")
+        self.assertEqual(payload["pane_id"], "w1:p1")
+        self.assertEqual(payload["pane_name"], "api")
+        self.assertEqual(payload["cwd"], "/tmp/src/api")
+        self.assertEqual(payload["session_id"], "s1")
+        self.assertEqual(payload["last_assistant_message"], "all done")
+        self.assertNotIn("last_assistant_message_truncated", payload)
+        self.assertEqual(
+            self.server.requests[0]["headers"]["authorization"], f"Bearer {FAKE_KEY}"
+        )
+        self._assert_pane("working", "done")
+        self._assert_no_secrets(proc)
+
+    def test_plugin_done_after_stop_hook_does_not_post_again(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        proc = self._run(_event(agent_status="idle"), agent=API)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_resume_after_stop_hook_done_retracts(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        proc = self._run(
+            _event(agent_status="working"), extra_env={"RETRACT_ON_RESUME": "1"}, agent=API
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        payload = json.loads(self.server.requests[1]["body"])
+        self.assertTrue(payload["retracted"])
+        self.assertEqual(payload["prior_status"], "done")
+
+    def test_focused_pane_resume_after_stop_hook_done_retracts(self):
+        # A focused pane ends its turn as idle. The stop hook must keep seen
+        # so the plugin still reads idle as done, then retracts on resume.
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        self._run(_event(agent_status="idle"), agent=API)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        proc = self._run(
+            _event(agent_status="working"), extra_env={"RETRACT_ON_RESUME": "1"}, agent=API
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertTrue(json.loads(self.server.requests[1]["body"])["retracted"])
+
+    def test_stop_hook_failed_post_restores_latch_for_plugin(self):
+        self._write_env(path="/fail")
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        proc = self._run_stop({"last_assistant_message": "x"}, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("working", None)
+        self._write_env()
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(len(self.server.requests), 2)
+        self._assert_no_secrets(proc)
+
+    def _settling_plugin_done(self) -> subprocess.Popen:
+        return self._start(
+            _event(),
+            extra_env={"SETTLE_MS": "1500", "SETTLE_ROUNDS": "1"},
+            agent={**API, "agent_status": "done"},
+        )
+
+    def test_stop_hook_during_plugin_settle_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        plugin = self._settling_plugin_done()
+        time.sleep(0.4)
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        plugin.communicate(timeout=15)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["source"], "stop_hook")
+        self._assert_pane("done", "done")
+
+    def test_failed_stop_hook_during_plugin_settle_still_delivers(self):
+        # A failed stop POST must not swallow the settled plugin run.
+        # The stop POST fails only after the plugin's post-settle check (1.5s).
+        self._write_env(path="/slow-fail-first")
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        plugin = self._settling_plugin_done()
+        time.sleep(0.4)
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        plugin.communicate(timeout=15)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertNotIn("source", json.loads(self.server.requests[1]["body"]))
+        self._assert_pane("done", "done")
+
+    def test_stop_hook_bad_input_still_exits_zero(self):
+        self._write_env()
+        env = self._env("", extra_env=None, agent=API, herdr_bin=None)
+        env.update({"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"})
+        deep = "[" * 200000 + "]" * 200000
+        proc = subprocess.run(
+            [sys.executable, str(HOOK), "stop", "claude"],
+            input=deep, capture_output=True, text=True, env=env, timeout=15, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        (self.config / ".env").write_bytes(b"WEBHOOK_URL=http://127.0.0.1:9/h\nWEBHOOK_KEY=\xff\xfe\n")
+        proc = subprocess.run(
+            [sys.executable, str(HOOK), "stop", "claude"],
+            input="{}", capture_output=True, text=True, env=env, timeout=15, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_stop_hook_outside_herdr_pane_is_noop(self):
+        self._write_env()
+        proc = self._run_stop({"last_assistant_message": "x"}, extra_env={"HERDR_PANE_ID": ""})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self._run_stop({"last_assistant_message": "x"}, extra_env={"HERDR_ENV": ""})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_stop_hook_active_does_not_post(self):
+        self._write_env()
+        proc = self._run_stop({"stop_hook_active": True, "last_assistant_message": "x"}, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_stop_hook_respects_skip_panes(self):
+        self._write_env("SKIP_PANES=ap*\n")
+        proc = self._run_stop({"last_assistant_message": "x"}, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_stop_hook_truncates_long_message(self):
+        self._write_env()
+        proc = self._run_stop({"last_assistant_message": "a" * 5000}, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(len(payload["last_assistant_message"]), 4000)
+        self.assertTrue(payload["last_assistant_message_truncated"])
+
+    def test_stop_hook_dry_run_keeps_stdout_empty(self):
+        self._write_env("WEBHOOK_DRY_RUN=1\n")
+        proc = self._run_stop({"last_assistant_message": "x"}, agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn('"source":"stop_hook"', proc.stderr)
+        self.assertEqual(self.server.requests, [])
 
 
 if __name__ == "__main__":

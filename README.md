@@ -111,6 +111,24 @@ Skip matching uses the resolved pane name. A pane Herdr cannot name still notifi
 
 Set `WEBHOOK_DRY_RUN=1` and trip a notify transition. `herdr plugin log list` should show the JSON and no POST.
 
+## Agent Stop hooks (instant done)
+
+Claude Code and Codex know exactly when their turn ends. `python3 hook.py stop <agent>` is a Stop hook that POSTs done right away, skipping SETTLE_MS and MIN_WORKING_MS. It only runs inside a Herdr pane (`HERDR_ENV=1` and `HERDR_PANE_ID`), reads the same plugin `.env`, honors SKIP_PANES, NOTIFY_STATUSES and WEBHOOK_DRY_RUN, and skips when `stop_hook_active` is true. After a successful POST it latches `posted=done`, so the settled plugin run for that turn (~60s later) stays quiet and a later working event still retracts. A failed POST leaves the latch untouched and the plugin run delivers as before. It always exits 0 and writes nothing to stdout, so it never blocks the agent.
+
+The payload is the usual object plus `source: "stop_hook"`, `session_id`, and `last_assistant_message` (first 4000 characters; `last_assistant_message_truncated: true` when cut). The config dir comes from `HERDR_PLUGIN_CONFIG_DIR`, else `herdr plugin config-dir jefflau.herdr-webhook`.
+
+Claude Code `~/.claude/settings.json`:
+
+```json
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3 /path/to/herdr-webhook/hook.py stop claude", "timeout": 15}]}]}}
+```
+
+Codex `~/.codex/hooks.json` (needs `[features] hooks = true`):
+
+```json
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3 /path/to/herdr-webhook/hook.py stop codex", "timeout": 15}]}]}}
+```
+
 ## Grok Bot webhook routines
 
 Create a webhook routine in Grok Bot. The URL and sender key live in that routine panel. Do not paste the sender key into chat.
