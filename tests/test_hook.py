@@ -1360,7 +1360,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(
             self.server.requests[0]["headers"]["authorization"], f"Bearer {FAKE_KEY}"
         )
-        self._assert_pane("done", "done")
+        self._assert_pane("working", "done")
         self._assert_no_secrets(proc)
 
     def test_plugin_done_after_stop_hook_does_not_post_again(self):
@@ -1385,6 +1385,22 @@ class HookTests(unittest.TestCase):
         payload = json.loads(self.server.requests[1]["body"])
         self.assertTrue(payload["retracted"])
         self.assertEqual(payload["prior_status"], "done")
+
+    def test_focused_pane_resume_after_stop_hook_done_retracts(self):
+        # A focused pane ends its turn as idle. The stop hook must keep seen
+        # so the plugin still reads idle as done, then retracts on resume.
+        self._write_env()
+        self._write_status({"w1:p1": {"seen": "working", "posted": None}})
+        self._run_stop({"last_assistant_message": "x"}, agent=API)
+        self._run(_event(agent_status="idle"), agent=API)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        proc = self._run(
+            _event(agent_status="working"), extra_env={"RETRACT_ON_RESUME": "1"}, agent=API
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertTrue(json.loads(self.server.requests[1]["body"])["retracted"])
 
     def test_stop_hook_failed_post_restores_latch_for_plugin(self):
         self._write_env(path="/fail")

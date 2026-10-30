@@ -1009,7 +1009,15 @@ def stop_main(agent: str) -> int:
     status_path = os.path.join(config_dir, STATUS_FILENAME)
     with _status_lock(status_path):
         store = _load_or_seed_statuses(status_path, notify)
-        store[pane_id] = _pane_state("done", "done", _claim_n(store.get(pane_id)) + 1)
+        record = store.get(pane_id)
+        # Keep seen: a focused pane ends its turn as idle, and the plugin only
+        # reads that idle as done (and later retracts it) while seen is working.
+        store[pane_id] = _pane_state(
+            _as_status(record.get("seen")) if record else "done",
+            "done",
+            _claim_n(record) + 1,
+            _working_since_n(record),
+        )
         _persist_store(status_path, store)
     return 0
 
